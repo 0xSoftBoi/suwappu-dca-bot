@@ -1,0 +1,22 @@
+{
+  "plans": [
+    {
+      "id": "daily-eth",
+      "name": "Daily ETH",
+      "fromToken": "USDC",
+      "toToken": "ETH",
+      "amount": 50,
+      "chain": "base",
+      "schedule": "0 9 * * *"
+    },
+    {
+      "id": "weekly-sol",
+      "name": "Weekly SOL",
+      "fromToken": "USDC",
+      "toToken": "SOL",
+      "amount": 100,
+      "chain": "solana",
+      "schedule": "0 9 * * 1"
+    }
+  ]
+}
