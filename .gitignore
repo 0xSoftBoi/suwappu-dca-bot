@@ -1,7 +1,12 @@
 node_modules/
 dist/
-*.tsbuildinfo
 .env
 .env.local
-.DS_Store
+__pycache__/
+*.pyc
+.venv/
+*.egg-info/
+.pytest_cache/
 *.log
+.DS_Store
+coverage/
