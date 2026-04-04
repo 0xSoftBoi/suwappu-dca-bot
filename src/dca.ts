@@ -51,6 +51,18 @@ export class DCAEngine {
         continue;
       }
 
+      // Simple check: reject "* * * * *" patterns (every minute)
+      if (plan.schedule.startsWith('* ') || plan.schedule === '* * * * *') {
+        console.error(`Schedule ${plan.schedule} runs too frequently. Minimum interval is 5 minutes.`);
+        continue;
+      }
+
+      const MAX_DCA_AMOUNT = parseFloat(process.env.SUWAPPU_MAX_TRADE_USD || '1000');
+      if (plan.amount <= 0 || plan.amount > MAX_DCA_AMOUNT) {
+        console.error(`Plan amount ${plan.amount} invalid. Must be > 0 and <= ${MAX_DCA_AMOUNT}`);
+        continue;
+      }
+
       const task = cron.schedule(plan.schedule, async () => {
         console.log(`[${new Date().toISOString()}] Executing: ${plan.name}`);
         const result = await this.executeBuy(plan);

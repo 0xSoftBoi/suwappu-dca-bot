@@ -29,6 +29,22 @@ export function loadConfig(configPath?: string): DCAConfig {
     );
   }
 
+  if (!Array.isArray(fileConfig.plans)) {
+    throw new Error("Config validation failed: 'plans' must be an array.");
+  }
+
+  const REQUIRED_PLAN_FIELDS: (keyof DCAPlan)[] = ['name', 'fromToken', 'toToken', 'amount', 'chain', 'schedule'];
+  fileConfig.plans.forEach((p, i) => {
+    for (const field of REQUIRED_PLAN_FIELDS) {
+      if (p[field] === undefined || p[field] === null || p[field] === '') {
+        throw new Error(`Config validation failed: plan[${i}] missing required field '${field}'.`);
+      }
+    }
+    if (typeof p.amount !== 'number' || isNaN(p.amount)) {
+      throw new Error(`Config validation failed: plan[${i}].amount must be a number.`);
+    }
+  });
+
   const plans = (fileConfig.plans ?? []).map((p, i) => ({
     ...p,
     id: p.id ?? `plan-${i}`,
