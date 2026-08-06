@@ -17,6 +17,7 @@ export interface DCAPlan {
   amount: number;
   chain: string;
   schedule: string;
+  timezone?: string;
   enabled?: boolean;
 }
 
@@ -77,6 +78,15 @@ export class DCAEngine {
         continue;
       }
 
+      if (plan.timezone) {
+        try {
+          new Intl.DateTimeFormat("en-US", { timeZone: plan.timezone }).format();
+        } catch {
+          console.error(`Invalid IANA timezone for "${plan.name}": ${plan.timezone}`);
+          continue;
+        }
+      }
+
       const task = cron.schedule(plan.schedule, async () => {
         if (this.runningPlans.has(plan.id)) {
           console.warn(
@@ -103,7 +113,7 @@ export class DCAEngine {
         } finally {
           this.runningPlans.delete(plan.id);
         }
-      });
+      }, plan.timezone ? { timezone: plan.timezone } : {});
 
       this.tasks.push(task);
     }
