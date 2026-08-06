@@ -1,8 +1,13 @@
 import cron from "node-cron";
-import { createClient, type SuwappuClient } from "@suwappu/sdk";
-import { readFileSync, writeFileSync, existsSync } from "fs";
-import { join } from "path";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "fs";
 import { homedir } from "os";
+import { join } from "path";
+import type { ExecutionMode } from "./execution.js";
+import {
+  executeManagedSwap,
+  getQuote,
+  simulateSwap,
+} from "./suwappu.js";
 
 export interface DCAPlan {
   id: string;
@@ -15,6 +20,8 @@ export interface DCAPlan {
   enabled?: boolean;
 }
 
+export type ExecutionOutcome = "preview" | "submitted" | "failed";
+
 export interface ExecutionEntry {
   timestamp: string;
   planId: string;
@@ -22,7 +29,10 @@ export interface ExecutionEntry {
   toToken: string;
   amount: number;
   chain: string;
-  success: boolean;
+  outcome: ExecutionOutcome;
+  quoteId?: string;
+  toAmount?: string;
+  swapId?: string;
   txHash?: string;
   error?: string;
 }
@@ -30,15 +40,19 @@ export interface ExecutionEntry {
 const HISTORY_PATH = join(homedir(), ".suwappu-dca", "history.json");
 
 export class DCAEngine {
-  private client: SuwappuClient;
-  private plans: DCAPlan[] = [];
-  private tasks: cron.ScheduledTask[] = [];
+  private readonly plans: DCAPlan[] = [];
+  private readonly tasks: cron.ScheduledTask[] = [];
+  private readonly runningPlans = new Set<string>();
 
-  constructor(apiKey: string) {
-    this.client = createClient({ apiKey });
-  }
+  constructor(
+    private readonly apiKey: string,
+    private readonly mode: ExecutionMode = { kind: "preview" },
+  ) {}
 
   addPlan(plan: DCAPlan): void {
+    if (this.plans.some((existing) => existing.id === plan.id)) {
+      throw new Error(`Duplicate DCA plan id: ${plan.id}`);
+    }
     this.plans.push(plan);
   }
 
@@ -51,25 +65,43 @@ export class DCAEngine {
         continue;
       }
 
-      // Simple check: reject "* * * * *" patterns (every minute)
-      if (plan.schedule.startsWith('* ') || plan.schedule === '* * * * *') {
-        console.error(`Schedule ${plan.schedule} runs too frequently. Minimum interval is 5 minutes.`);
+      if (plan.schedule.trim() === "* * * * *") {
+        console.error(
+          `Schedule for "${plan.name}" runs every minute and is disabled by this example.`,
+        );
         continue;
       }
 
-      const MAX_DCA_AMOUNT = parseFloat(process.env.SUWAPPU_MAX_TRADE_USD || '1000');
-      if (plan.amount <= 0 || plan.amount > MAX_DCA_AMOUNT) {
-        console.error(`Plan amount ${plan.amount} invalid. Must be > 0 and <= ${MAX_DCA_AMOUNT}`);
+      if (!Number.isFinite(plan.amount) || plan.amount <= 0) {
+        console.error(`Plan amount for "${plan.name}" must be a positive source-token amount.`);
         continue;
       }
 
       const task = cron.schedule(plan.schedule, async () => {
-        console.log(`[${new Date().toISOString()}] Executing: ${plan.name}`);
-        const result = await this.executeBuy(plan);
-        if (result.success) {
-          console.log(`  ✓ Bought ${plan.toToken} for $${plan.amount} — TX: ${result.txHash}`);
-        } else {
-          console.log(`  ✗ Failed: ${result.error}`);
+        if (this.runningPlans.has(plan.id)) {
+          console.warn(
+            `[${new Date().toISOString()}] Skipping overlapping run: ${plan.name}`,
+          );
+          return;
+        }
+
+        this.runningPlans.add(plan.id);
+        try {
+          console.log(`[${new Date().toISOString()}] DCA trigger: ${plan.name}`);
+          const result = await this.executeBuy(plan);
+          if (result.outcome === "preview") {
+            console.log(
+              `  Preview: ${plan.amount} ${plan.fromToken} → ${result.toAmount ?? "?"} ${plan.toToken}`,
+            );
+          } else if (result.outcome === "submitted") {
+            console.log(
+              `  Submitted: swap ${result.swapId ?? "unknown"} | TX: ${result.txHash ?? "pending"}`,
+            );
+          } else {
+            console.log(`  Failed: ${result.error}`);
+          }
+        } finally {
+          this.runningPlans.delete(plan.id);
         }
       });
 
@@ -78,10 +110,8 @@ export class DCAEngine {
   }
 
   stop(): void {
-    for (const task of this.tasks) {
-      task.stop();
-    }
-    this.tasks = [];
+    for (const task of this.tasks) task.stop();
+    this.tasks.length = 0;
   }
 
   async executeBuy(plan: DCAPlan): Promise<ExecutionEntry> {
@@ -92,22 +122,47 @@ export class DCAEngine {
       toToken: plan.toToken,
       amount: plan.amount,
       chain: plan.chain,
-      success: false,
+      outcome: "failed",
     };
 
     try {
-      const quote = await this.client.getQuote(
-        plan.fromToken,
-        plan.toToken,
-        plan.amount,
-        plan.chain
-      );
+      if (!Number.isFinite(plan.amount) || plan.amount <= 0) {
+        throw new Error("DCA amount must be a positive source-token amount");
+      }
 
-      const tx = await this.client.executeSwap(quote.id);
-      entry.success = true;
-      entry.txHash = tx.txHash;
-    } catch (err) {
-      entry.error = err instanceof Error ? err.message : String(err);
+      const quote = await getQuote(this.apiKey, {
+        from: plan.fromToken,
+        to: plan.toToken,
+        amount: plan.amount,
+        chain: plan.chain,
+        ...(this.mode.kind === "managed"
+          ? { walletAddress: this.mode.walletAddress }
+          : {}),
+      });
+      entry.quoteId = quote.id;
+      entry.toAmount = quote.toAmount;
+
+      if (this.mode.kind === "preview") {
+        entry.outcome = "preview";
+      } else {
+        const simulation = await simulateSwap(
+          this.apiKey,
+          quote.id,
+          this.mode.walletAddress,
+        );
+        if (simulation.success !== true) {
+          throw new Error(
+            `Swap simulation failed: ${simulation.reason ?? "no success response"}`,
+          );
+        }
+
+        const swap = await executeManagedSwap(this.apiKey, quote.id);
+        entry.outcome = "submitted";
+        entry.swapId = swap.swapId;
+        entry.txHash = swap.txHash;
+      }
+    } catch (error) {
+      entry.error = error instanceof Error ? error.message : String(error);
     }
 
     this.appendHistory(entry);
@@ -116,8 +171,23 @@ export class DCAEngine {
 
   getHistory(): ExecutionEntry[] {
     if (!existsSync(HISTORY_PATH)) return [];
-    const raw = readFileSync(HISTORY_PATH, "utf-8");
-    return JSON.parse(raw) as ExecutionEntry[];
+
+    const parsed = JSON.parse(readFileSync(HISTORY_PATH, "utf-8")) as Array<
+      Partial<ExecutionEntry> & { success?: boolean }
+    >;
+    if (!Array.isArray(parsed)) return [];
+
+    return parsed.map((entry) => ({
+      ...entry,
+      outcome:
+        entry.outcome === "preview" ||
+        entry.outcome === "submitted" ||
+        entry.outcome === "failed"
+          ? entry.outcome
+          : entry.success
+            ? "submitted"
+            : "failed",
+    })) as ExecutionEntry[];
   }
 
   private appendHistory(entry: ExecutionEntry): void {
@@ -125,10 +195,7 @@ export class DCAEngine {
     history.push(entry);
 
     const dir = join(homedir(), ".suwappu-dca");
-    if (!existsSync(dir)) {
-      const { mkdirSync } = require("fs");
-      mkdirSync(dir, { recursive: true });
-    }
+    if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
 
     writeFileSync(HISTORY_PATH, JSON.stringify(history, null, 2));
   }
