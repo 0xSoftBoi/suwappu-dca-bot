@@ -1,6 +1,6 @@
 ---
 name: suwappu-dca
-description: Dollar Cost Averaging bot — schedule recurring token buys on any of 15 chains with cron scheduling
+description: Preview-first Suwappu DCA scheduler for recurring token purchases across 14 supported chains
 user-invocable: true
 tools:
   - start_dca
@@ -13,41 +13,63 @@ metadata:
   openclaw.emoji: "📅"
   openclaw.category: defi
   openclaw.tags: ["dca", "trading", "scheduling", "defi", "cross-chain"]
-  openclaw.install:
-    - type: npm
-      package: "suwappu-dca-bot"
 ---
 
 # Suwappu DCA Bot
 
-Schedule recurring token purchases with cron-based timing. "Buy $50 of ETH on Base every day" — the bot handles quotes and execution automatically.
+Use this skill to configure, preview, and inspect recurring Suwappu purchase plans.
+
+The safe default is read/quote-only preview. Do not infer permission to submit managed swaps from a request to configure, inspect, start, or preview a DCA plan.
 
 ## Setup
 
+Clone the repository and install it locally:
+
 ```bash
+bun install --frozen-lockfile
 export SUWAPPU_API_KEY=suwappu_sk_...
 ```
+
+This example is not currently published as an npm package.
 
 ## Tools
 
 ### start_dca
-Start the DCA scheduler with configured plans. Runs continuously, executing buys on schedule.
+
+Start configured schedules. Default behavior is preview-only at every trigger.
+
+Only use managed execution when the user explicitly asks to execute, `--execute` is present, `SUWAPPU_ALLOW_MANAGED_EXECUTION=1`, and `SUWAPPU_WALLET_ADDRESS` identifies the intended wallet.
 
 ### dca_status
-Show all active DCA plans with their schedules and next execution time.
+
+Show configured source-token amounts, pairs, chains, cron expressions, timezones, and enabled state. This does not execute.
 
 ### dca_history
-Display past DCA executions with amounts, transaction hashes, and success/failure.
+
+Show distinct `preview`, `submitted`, and `failed` outcomes plus quote/swap identifiers when available.
 
 ### run_once
-Execute a single DCA buy immediately: `run_once --from USDC --to ETH --amount 50 --chain base`
 
-## Configuration
+Preview a single purchase by default. `amount` is source-token units, not automatically USD.
 
-```json
-{
-  "plans": [
-    { "name": "Daily ETH", "fromToken": "USDC", "toToken": "ETH", "amount": 50, "chain": "base", "schedule": "0 9 * * *" }
-  ]
-}
+## Execution boundary
+
+For managed execution the implementation must follow:
+
+```text
+wallet-bound quote
+  → simulation success === true
+  → managed /swap/execute submission
 ```
+
+A configured API key, wallet, schedule, or environment opt-in alone is not sufficient authorization. The command still requires `--execute`.
+
+For self-custody workflows, use Suwappu's unsigned transaction preparation flow instead of this scheduler's managed endpoint.
+
+## Scheduling
+
+Prefer an explicit IANA `timezone` such as `America/New_York` or `UTC`. Plans with the same id are rejected, and an overlapping run of a plan is skipped.
+
+Use Suwappu wallet policies for durable value/asset limits; client-side cron and amount checks are not a substitute for server-side policy.
+
+Builder docs: https://docs.suwappu.bot
