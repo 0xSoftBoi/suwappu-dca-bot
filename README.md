@@ -6,7 +6,7 @@
 [![TypeScript](https://img.shields.io/badge/TypeScript-5.6-blue.svg)](https://www.typescriptlang.org)
 [![Suwappu SDK](https://img.shields.io/badge/Suwappu_SDK-0.5.0-purple.svg)](https://www.npmjs.com/package/@suwappu/sdk)
 
-Configure recurring token purchases with cron scheduling. "Buy $50 of ETH on Base every morning" — the bot handles quoting and execution automatically across any of 15 supported chains.
+Configure recurring token purchases with cron scheduling. "Buy $50 of ETH on Base every morning" — the bot handles quoting and execution automatically across any of 14 supported chains.
 
 ---
 
@@ -14,7 +14,7 @@ Configure recurring token purchases with cron scheduling. "Buy $50 of ETH on Bas
 
 - **Cron scheduling** — Standard cron expressions for precise timing
 - **Multi-plan** — Run multiple DCA plans simultaneously
-- **Any token, any chain** — Works across 15 networks including Ethereum, Solana, Base, Arbitrum
+- **Any token, any chain** — Works across 14 networks including Ethereum, Solana, Base, Arbitrum
 - **Execution history** — Persistent log of all past buys with transaction hashes
 - **One-time buy** — Execute a single purchase immediately via CLI
 - **OpenClaw compatible** — Includes SKILL.md for AI agent discovery
