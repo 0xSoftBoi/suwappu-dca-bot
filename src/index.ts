@@ -45,7 +45,7 @@ program
       console.log(
         `  ${chalk.cyan(plan.name)}: ${plan.amount} ${plan.fromToken} → ${plan.toToken} on ${plan.chain}`,
       );
-      console.log(`    Schedule: ${plan.schedule}`);
+      console.log(`    Schedule: ${plan.schedule}`);\n      console.log(`    Timezone: ${plan.timezone ?? "host default"}`);
     }
     console.log(chalk.dim("\nPress Ctrl+C to stop.\n"));
 
@@ -67,7 +67,7 @@ program
       console.log(`  ${chalk.cyan(plan.name)}`);
       console.log(`    ${plan.fromToken} → ${plan.toToken}: ${plan.amount} ${plan.fromToken}`);
       console.log(`    Chain: ${plan.chain}`);
-      console.log(`    Schedule: ${plan.schedule}`);
+      console.log(`    Schedule: ${plan.schedule}`);\n      console.log(`    Timezone: ${plan.timezone ?? "host default"}`);
       console.log(
         `    Enabled: ${plan.enabled !== false ? chalk.green("yes") : chalk.red("no")}`,
       );
