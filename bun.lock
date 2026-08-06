@@ -5,7 +5,6 @@
     "": {
       "name": "suwappu-dca-bot",
       "dependencies": {
-        "@suwappu/sdk": "^0.4.0",
         "chalk": "^5.3.0",
         "commander": "^12.0.0",
         "node-cron": "^3.0.0",
@@ -21,9 +20,7 @@
   "packages": {
     "@colors/colors": ["@colors/colors@1.5.0", "", {}, "sha512-ooWCrlZP11i8GImSjTHYHLkvFDP48nS4+204nGb1RiX/WXYHmJA2III9/e2DWVabCESdW7hBAEzHRqUn9OUVvQ=="],
 
-    "@suwappu/openclaw": ["@suwappu/openclaw@0.2.0", "", { "bin": { "suwappu-openclaw": "src/cli.ts" } }, "sha512-S78WVyj4pqtPNITZluz1Itg9PoQIaR3S2+DhsOKh1LtOmBc0dEPU9L5zIQQzVg0UX8WMpHuphYTV43MeoOsDmQ=="],
 
-    "@suwappu/sdk": ["@suwappu/sdk@0.4.0", "", { "dependencies": { "@suwappu/openclaw": "^0.2.0", "chalk": "^5.3.0", "cli-table3": "^0.6.5", "commander": "^12.0.0", "ora": "^8.0.0" }, "bin": { "suwappu": "src/cli.ts" } }, "sha512-kFIzTKQTG7nPbRXiizt7YWW8yyA0PyJ8q6wwebqVMRXdgjRjH/ZX54DUX5C1qajVm8oTZg/jbiA+JoWT/hWlog=="],
 
     "@types/node": ["@types/node@25.4.0", "", { "dependencies": { "undici-types": "~7.18.0" } }, "sha512-9wLpoeWuBlcbBpOY3XmzSTG3oscB6xjBEEtn+pYXTfhyXhIxC5FsBer2KTopBlvKEiW9l13po9fq+SJY/5lkhw=="],
 
