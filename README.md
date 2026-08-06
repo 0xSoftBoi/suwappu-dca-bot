@@ -1,60 +1,53 @@
-# suwappu-dca-bot
+# Suwappu DCA Bot
 
-**Dollar Cost Averaging bot for the [Suwappu](https://suwappu.bot) cross-chain DEX.**
+A preview-first recurring-buy example for builders using [Suwappu](https://suwappu.bot).
 
-[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
-[![TypeScript](https://img.shields.io/badge/TypeScript-5.6-blue.svg)](https://www.typescriptlang.org)
-[![Suwappu SDK](https://img.shields.io/badge/Suwappu_SDK-0.5.0-purple.svg)](https://www.npmjs.com/package/@suwappu/sdk)
+It combines cron scheduling with the current Suwappu quote → simulation → managed-execution lifecycle. By default, scheduled and one-off runs only request quotes; they cannot submit a transaction.
 
-Configure recurring token purchases with cron scheduling. "Buy $50 of ETH on Base every morning" — the bot handles quoting and execution automatically across any of 15 supported chains.
+> This is an integration example, not financial advice. Start with a dedicated wallet, restrictive Suwappu wallet policies, and small source-token amounts.
 
----
+## What this teaches
 
-## Features
+- Model recurring purchase plans independently from execution credentials.
+- Give cron plans explicit IANA timezones instead of inheriting a container's timezone by accident.
+- Prevent overlapping executions of the same plan.
+- Bind a live quote to the intended wallet and simulate it before managed submission.
+- Keep recurring automation previewable until the operator opts into execution twice.
+- Record previews, submitted swaps, and failures as different outcomes.
 
-- **Cron scheduling** — Standard cron expressions for precise timing
-- **Multi-plan** — Run multiple DCA plans simultaneously
-- **Any token, any chain** — Works across 15 networks including Ethereum, Solana, Base, Arbitrum
-- **Execution history** — Persistent log of all past buys with transaction hashes
-- **One-time buy** — Execute a single purchase immediately via CLI
-- **OpenClaw compatible** — Includes SKILL.md for AI agent discovery
+Suwappu currently supports 14 chains; discover available chains/tokens from the API rather than hard-coding provider counts.
 
----
+## Safe execution model
 
-## Quick Start
+| Mode | How to enter it | Behavior |
+|---|---|---|
+| Preview | default | scheduled/one-off quotes only |
+| Managed execution | `--execute` **and** `SUWAPPU_ALLOW_MANAGED_EXECUTION=1` | wallet-bound quote → simulation → managed submit |
+| Self-custody | not implemented here | use Suwappu's unsigned transaction flow |
+
+Managed mode also requires `SUWAPPU_WALLET_ADDRESS`. If simulation does not explicitly return `success: true`, no execution request is made.
+
+## Quick start
 
 ```bash
-# 1. Clone
 git clone https://github.com/0xSoftBoi/suwappu-dca-bot.git
 cd suwappu-dca-bot
+bun install --frozen-lockfile
 
-# 2. Install
-bun install
-
-# 3. Get a free API key
 curl -X POST https://api.suwappu.bot/v1/agent/register \
   -H "Content-Type: application/json" \
-  -d '{"name": "my-dca-bot"}'
+  -d '{"name":"my-dca-bot"}'
 
-# 4. Set your key
 export SUWAPPU_API_KEY=suwappu_sk_...
 
-# 5. Copy example config
 mkdir -p ~/.suwappu-dca
 cp examples/dca-config.example.json ~/.suwappu-dca/config.json
 
-# 6. Start the bot
+# Preview every scheduled trigger. No transaction submission.
 bun src/index.ts start
-
-# Or: one-time buy
-bun src/index.ts run-once --from USDC --to ETH --amount 50 --chain base
 ```
 
----
-
-## Configuration
-
-Place your config at `~/.suwappu-dca/config.json`:
+## Plan configuration
 
 ```json
 {
@@ -66,56 +59,32 @@ Place your config at `~/.suwappu-dca/config.json`:
       "toToken": "ETH",
       "amount": 50,
       "chain": "base",
-      "schedule": "0 9 * * *"
-    },
-    {
-      "id": "weekly-sol",
-      "name": "Weekly SOL",
-      "fromToken": "USDC",
-      "toToken": "SOL",
-      "amount": 100,
-      "chain": "solana",
-      "schedule": "0 9 * * 1"
+      "schedule": "0 9 * * *",
+      "timezone": "America/New_York"
     }
   ]
 }
 ```
 
-### Plan Fields
+| Field | Required | Meaning |
+|---|---|---|
+| `id` | recommended | Unique plan id; generated when omitted |
+| `name` | yes | Human-readable name |
+| `fromToken` | yes | Source token |
+| `toToken` | yes | Target token |
+| `amount` | yes | **Source-token units** per run |
+| `chain` | yes | Chain for the quote/swap |
+| `schedule` | yes | Standard 5-field cron expression |
+| `timezone` | no | IANA timezone, e.g. `America/New_York`; otherwise host timezone |
+| `enabled` | no | Defaults to `true` |
 
-| Field | Type | Description |
-|-------|------|-------------|
-| `id` | `string` | Unique plan identifier |
-| `name` | `string` | Human-readable name |
-| `fromToken` | `string` | Token to sell (e.g. `"USDC"`) |
-| `toToken` | `string` | Token to buy (e.g. `"ETH"`) |
-| `amount` | `number` | USD amount per buy |
-| `chain` | `string` | Chain to execute on |
-| `schedule` | `string` | Cron expression |
-| `enabled` | `boolean` | Optional. Default: `true` |
+Despite the strategy name, `amount` is not inherently USD. `amount: 50` with `fromToken: "USDC"` means 50 USDC; with `fromToken: "ETH"` it means 50 ETH. A classic dollar-cost-averaging plan normally uses a dollar stablecoin as the source token.
 
-### Cron Schedule Reference
+Duplicate plan ids are rejected. If a scheduled callback is still running when the same plan triggers again, the overlapping run is skipped.
 
-| Pattern | Description |
-|---------|-------------|
-| `0 9 * * *` | Every day at 9:00 AM |
-| `0 9 * * 1` | Every Monday at 9:00 AM |
-| `0 */4 * * *` | Every 4 hours |
-| `0 9 1 * *` | First of every month |
-| `0 9,21 * * *` | Twice daily at 9 AM and 9 PM |
+The every-minute expression `* * * * *` is disabled by this example. For real recurring execution, choose a deliberate cadence and configure server-side wallet policy limits as the durable safety boundary.
 
----
-
-## Commands
-
-| Command | Description |
-|---------|-------------|
-| `start` | Start the DCA scheduler (runs continuously) |
-| `status` | Show all configured plans |
-| `history` | Show past execution log |
-| `run-once` | Execute a single buy immediately |
-
-### Run-Once Options
+## One-off preview
 
 ```bash
 bun src/index.ts run-once \
@@ -125,24 +94,92 @@ bun src/index.ts run-once \
   --chain base
 ```
 
----
+This obtains and records a quote but does not submit it.
 
-## How It Works
+## Enabling managed DCA
 
-1. **Configure** — Define plans with token pairs, amounts, and cron schedules
-2. **Schedule** — Bot registers cron jobs for each enabled plan
-3. **Execute** — At each trigger, gets a quote from Suwappu and executes the swap
-4. **Log** — Records every execution to `~/.suwappu-dca/history.json`
+Set the intended managed wallet and the independent environment opt-in, then pass `--execute`:
 
----
+```bash
+export SUWAPPU_WALLET_ADDRESS=0x...
+export SUWAPPU_ALLOW_MANAGED_EXECUTION=1
 
-## Environment Variables
+# Scheduled live mode
+bun src/index.ts start --execute
 
-| Variable | Required | Description |
-|----------|----------|-------------|
-| `SUWAPPU_API_KEY` | Yes | Your Suwappu API key |
+# One explicitly requested live run
+bun src/index.ts run-once \
+  --from USDC \
+  --to ETH \
+  --amount 50 \
+  --chain base \
+  --execute
+```
 
----
+Each live trigger:
+
+1. gets a fresh quote with `wallet_address`;
+2. simulates the quote for that wallet;
+3. requires `success: true`;
+4. sends the quote id to `POST /v1/agent/swap/execute`;
+5. records the managed `swap_id`, status, and transaction hash when available.
+
+The API may accept a managed swap before a transaction hash exists; use swap status/history in larger systems instead of treating “hash pending” as failure.
+
+## Commands
+
+| Command | Purpose |
+|---|---|
+| `start` | Run all enabled schedules; preview by default |
+| `status` | Show plan amounts, schedules, and timezones |
+| `history` | Show preview/submitted/failed outcomes |
+| `run-once` | Preview one buy; add `--execute` for managed submission |
+
+## Current SDK publication boundary
+
+The npm package is currently `@suwappu/sdk@0.4.0`, while the Suwappu repository already contains newer 0.6 TypeScript SDK source. The older package's swap execution helper targets the previous execution contract, so this example uses a small typed adapter in `src/suwappu.ts` for today's production endpoints instead of claiming an unpublished SDK.
+
+The newer SDK source expresses the same distinction directly:
+
+```text
+getQuote({ ..., walletAddress })
+  → simulateSwap({ quoteId, walletAddress })
+  → swap(quote)                         # managed execution
+
+prepareSwap({ quoteId, walletAddress }) # unsigned/self-custody
+```
+
+The hosted MCP endpoint is `https://api.suwappu.bot/mcp`. Its `execute_swap` tool prepares an unsigned/self-custody transaction; it is not the managed execution step used by this scheduler.
+
+## Environment
+
+| Variable | Required | Purpose |
+|---|---|---|
+| `SUWAPPU_API_KEY` | Yes | Agent authentication |
+| `SUWAPPU_WALLET_ADDRESS` | Managed mode | Wallet bound to quote + simulation |
+| `SUWAPPU_ALLOW_MANAGED_EXECUTION` | Managed mode | Must equal `1` in addition to `--execute` |
+| `SUWAPPU_API_URL` | No | API base override for development |
+
+Prefer `SUWAPPU_API_KEY` over putting credentials into the JSON config.
+
+## Installation note
+
+This example repository is not currently published as an npm package. Clone it and run it with Bun as shown above.
+
+## Develop
+
+```bash
+bun run typecheck
+bun test
+```
+
+CI uses Bun 1.3.14, a frozen lockfile, blocking typecheck, and regression tests.
+
+## Build further
+
+- [Suwappu docs](https://docs.suwappu.bot)
+- [SDK source](https://github.com/0xSoftBoi/suwappubot/tree/main/packages/sdk)
+- [Agent/MCP docs](https://github.com/0xSoftBoi/suwappubot/blob/main/docs/agent-clients.md)
 
 ## License
 
