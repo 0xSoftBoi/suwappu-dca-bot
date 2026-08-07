@@ -1,6 +1,6 @@
 ---
 name: suwappu-dca
-description: Preview-first Suwappu DCA scheduler for recurring token purchases across 14 supported chains
+description: Preview, run, and inspect fixed-USDC recurring Suwappu purchase plans with explicit schedule, gas, execution, idempotency, and reconciliation boundaries
 user-invocable: true
 tools:
   - start_dca
@@ -12,64 +12,82 @@ metadata:
   openclaw.primaryEnv: SUWAPPU_API_KEY
   openclaw.emoji: "📅"
   openclaw.category: defi
-  openclaw.tags: ["dca", "trading", "scheduling", "defi", "cross-chain"]
+  openclaw.tags: ["dca", "trading", "scheduling", "defi", "automation"]
 ---
 
-# Suwappu DCA Bot
+# Suwappu DCA
 
-Use this skill to configure, preview, and inspect recurring Suwappu purchase plans.
+Treat recurring purchase plans as durable economic intent, not as permission to fire a swap whenever cron calls back.
 
-The safe default is read/quote-only preview. Do not infer permission to submit managed swaps from a request to configure, inspect, start, or preview a DCA plan.
+## Default authority
 
-## Setup
+- Preview unless the user explicitly requests managed execution.
+- Require both `--execute` and `SUWAPPU_ALLOW_MANAGED_EXECUTION=1` for managed mode.
+- Require `SUWAPPU_WALLET_ADDRESS` for a managed wallet-aware quote/simulation.
+- Never infer execution authority from an API key, funded wallet, enabled schedule, or prior live run.
+- Use Suwappu's unsigned transaction preparation path for self-custody rather than this scheduler's managed endpoint.
 
-Clone the repository and install it locally:
+## Plan contract
 
-```bash
-bun install --frozen-lockfile
-export SUWAPPU_API_KEY=suwappu_sk_...
+Require:
+
+- stable explicit plan `id`;
+- `fromToken: USDC` so amount/caps have fixed-dollar meaning;
+- positive `amount` at/below `SUWAPPU_MAX_DCA_USDC`;
+- non-USDC destination and explicit chain;
+- valid five-field cron with one literal minute (no sub-hour cadence);
+- explicit IANA timezone or the implementation's `UTC` default;
+- positive `maxGasUsd` no larger than the action amount.
+
+Treat one plan + local wall-clock schedule slot as one economic action. Do not create a second action for a repeated DST wall-clock slot.
+
+## Preview
+
+Request a fresh route and require valid input/output/minimum output, gas estimate, and useful TTL. Refuse promotion when `estimated_gas_usd > maxGasUsd`.
+
+Record preview/failed outcomes in the durable journal. Do not submit.
+
+## Managed execution
+
+Preserve this order:
+
+```text
+persist intent
+  -> fresh wallet-aware quote + gas/TTL guard
+  -> /swap/simulate with would_execute === true
+  -> persist submitting
+  -> /swap/execute with intent ID as Idempotency-Key
+  -> reconcile known swap ID to terminal status/final amounts
 ```
 
-This example is not currently published as an npm package.
+An HTTP/top-level `success: true` simulation is insufficient when `would_execute` is false.
+
+Treat timeout, network failure after write, 5xx, or malformed successful execute response as `outcome_unknown`. Retry the same economic terms only with the same persisted idempotency key.
+
+If a plan has a `prepared`, `submitting`, `submitted`, or `outcome_unknown` action, recover that action before a fresh schedule installment. A known swap ID is poll-only; never resubmit it.
 
 ## Tools
 
-### start_dca
+### `start_dca`
 
-Start configured schedules. Default behavior is preview-only at every trigger.
+Start validated schedules in preview mode by default. In managed mode, keep background status reconciliation read-only and preserve the durable journal across restarts.
 
-Only use managed execution when the user explicitly asks to execute, `--execute` is present, `SUWAPPU_ALLOW_MANAGED_EXECUTION=1`, and `SUWAPPU_WALLET_ADDRESS` identifies the intended wallet.
+### `dca_status`
 
-### dca_status
+Show plan ID, USDC amount, destination, chain, cron, timezone, gas ceiling, and enabled state. Do not execute.
 
-Show configured source-token amounts, pairs, chains, cron expressions, timezones, and enabled state. This does not execute.
+### `dca_history`
 
-### dca_history
+Show distinct `preview`, `prepared`, `submitting`, `submitted`, `completed`, `failed`, and `outcome_unknown` states. Reconciliation may poll known swap IDs but must never create a quote or submit.
 
-Show distinct `preview`, `submitted`, and `failed` outcomes plus quote/swap identifiers when available.
+### `run_once`
 
-### run_once
+Preview one fixed-USDC action by default. Require an explicit gas ceiling. If an earlier manual action is unresolved, recover it instead of silently creating another one.
 
-Preview a single purchase by default. `amount` is source-token units, not automatically USD.
+## State safety
 
-## Execution boundary
+Keep `execution-journal.json` durable. Never delete an unresolved intent to clear an error. The local JSON implementation is single-writer; use transactional storage and uniqueness/locking before multiple replicas.
 
-For managed execution the implementation must follow:
-
-```text
-wallet-bound quote
-  → simulation success === true
-  → managed /swap/execute submission
-```
-
-A configured API key, wallet, schedule, or environment opt-in alone is not sufficient authorization. The command still requires `--execute`.
-
-For self-custody workflows, use Suwappu's unsigned transaction preparation flow instead of this scheduler's managed endpoint.
-
-## Scheduling
-
-Prefer an explicit IANA `timezone` such as `America/New_York` or `UTC`. Plans with the same id are rejected, and an overlapping run of a plan is skipped.
-
-Use Suwappu wallet policies for durable value/asset limits; client-side cron and amount checks are not a substitute for server-side policy.
+Use server-side wallet policies as an independent limit; client cron/amount/gas checks are defense in depth.
 
 Builder docs: https://docs.suwappu.bot

@@ -1,7 +1,7 @@
 {
   "name": "suwappu-dca-bot",
-  "version": "1.0.0",
-  "description": "Preview-first DCA scheduler example using Suwappu",
+  "version": "1.1.0",
+  "description": "Outcome-safe fixed-USDC DCA scheduler reference using Suwappu",
   "type": "module",
   "bin": {
     "suwappu-dca": "src/index.ts"
@@ -21,16 +21,17 @@
   "keywords": ["suwappu", "dca", "dollar-cost-averaging", "defi", "trading", "bot"],
   "author": "Suwappu",
   "dependencies": {
-    "chalk": "^5.3.0",
-    "commander": "^12.0.0",
-    "node-cron": "^3.0.0",
-    "ora": "^8.0.0"
+    "chalk": "5.6.2",
+    "commander": "12.1.0",
+    "node-cron": "3.0.3",
+    "ora": "8.2.0"
   },
   "devDependencies": {
-    "@types/node-cron": "^3.0.0",
-    "bun-types": "^1.3.10",
-    "typescript": "^5.6.0"
+    "@types/node-cron": "3.0.11",
+    "bun-types": "1.3.10",
+    "typescript": "5.9.3"
   },
+  "engines": { "bun": ">=1.3.14" },
   "packageManager": "bun@1.3.14",
   "license": "MIT"
 }

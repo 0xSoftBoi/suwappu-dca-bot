@@ -1,33 +1,39 @@
 # Suwappu DCA Bot
 
-A preview-first recurring-buy example for builders using [Suwappu](https://suwappu.bot).
+An outcome-safe reference for building fixed-dollar recurring purchase products on [Suwappu](https://suwappu.bot).
 
-It combines cron scheduling with the current Suwappu quote → simulation → managed-execution lifecycle. By default, scheduled and one-off runs only request quotes; they cannot submit a transaction.
+This repository focuses on the hard part of DCA automation: turning one scheduled wall-clock slot into at most one durable economic action, then following that action through quote, permission, idempotent submission, and terminal reconciliation.
 
-> This is an integration example, not financial advice. Start with a dedicated wallet, restrictive Suwappu wallet policies, and small source-token amounts.
+> This is an integration reference, not a claim that DCA is profitable or financial advice. It does not choose assets, predict returns, or guarantee that a recurring plan will outperform another allocation.
 
 ## What this teaches
 
-- Model recurring purchase plans independently from execution credentials.
-- Give cron plans explicit IANA timezones instead of inheriting a container's timezone by accident.
-- Prevent overlapping executions of the same plan.
-- Bind a live quote to the intended wallet and simulate it before managed submission.
-- Keep recurring automation previewable until the operator opts into execution twice.
-- Record previews, submitted swaps, and failures as different outcomes.
+| Builder problem | Pattern in this repo |
+|---|---|
+| “DCA” amount is ambiguous | This reference accepts USDC only, so plan amounts/caps are fixed-dollar accounting |
+| Cron fires twice or a DST hour repeats | Stable plan ID + local wall-clock schedule-slot key dedupes the action |
+| Process restarts after a money-moving request | Atomic durable intent exists before submission risk |
+| Execute response times out | Preserve `outcome_unknown` and retry only with the original `Idempotency-Key` |
+| Old swap is still pending at the next slot | The unresolved action owns the plan; reconcile/recover it and skip the new installment |
+| Quote is technically valid but uneconomic | Require `estimated_gas_usd <= maxGasUsd` and useful quote TTL |
+| Simulation request returned HTTP 200 | Still require `would_execute === true` |
+| Submission looks successful | Poll status and keep final amounts distinct from quoted amounts |
 
-Suwappu currently supports 14 chains; discover available chains/tokens from the API rather than hard-coding provider counts.
+If you are turning the scheduler into a paid product, continue with [BUILDING_A_PRODUCT.md](BUILDING_A_PRODUCT.md).
 
 ## Safe execution model
 
-| Mode | How to enter it | Behavior |
-|---|---|---|
-| Preview | default | scheduled/one-off quotes only |
-| Managed execution | `--execute` **and** `SUWAPPU_ALLOW_MANAGED_EXECUTION=1` | wallet-bound quote → simulation → managed submit |
-| Self-custody | not implemented here | use Suwappu's unsigned transaction flow |
+| Mode | Enter it | Can submit? |
+|---|---|---:|
+| Preview | default | No |
+| Managed | `--execute` **and** `SUWAPPU_ALLOW_MANAGED_EXECUTION=1` | Yes |
+| Self-custody | not implemented here | No; use Suwappu's unsigned transaction flow |
 
-Managed mode also requires `SUWAPPU_WALLET_ADDRESS`. If simulation does not explicitly return `success: true`, no execution request is made.
+Managed mode also requires `SUWAPPU_WALLET_ADDRESS`. API credentials, a wallet, or an enabled plan do not silently grant transaction authority.
 
 ## Quick start
+
+Requires Bun 1.3.14 or newer.
 
 ```bash
 git clone https://github.com/0xSoftBoi/suwappu-dca-bot.git
@@ -43,9 +49,11 @@ export SUWAPPU_API_KEY=suwappu_sk_...
 mkdir -p ~/.suwappu-dca
 cp examples/dca-config.example.json ~/.suwappu-dca/config.json
 
-# Preview every scheduled trigger. No transaction submission.
+# Every scheduled trigger is quote-only preview.
 bun src/index.ts start
 ```
+
+The plan file never loads an API key. Keep credentials in environment/secret management, not alongside schedule configuration.
 
 ## Plan configuration
 
@@ -60,7 +68,8 @@ bun src/index.ts start
       "amount": 50,
       "chain": "base",
       "schedule": "0 9 * * *",
-      "timezone": "America/New_York"
+      "timezone": "America/New_York",
+      "maxGasUsd": 2
     }
   ]
 }
@@ -68,103 +77,141 @@ bun src/index.ts start
 
 | Field | Required | Meaning |
 |---|---|---|
-| `id` | recommended | Unique plan id; generated when omitted |
-| `name` | yes | Human-readable name |
-| `fromToken` | yes | Source token |
-| `toToken` | yes | Target token |
-| `amount` | yes | **Source-token units** per run |
-| `chain` | yes | Chain for the quote/swap |
-| `schedule` | yes | Standard 5-field cron expression |
-| `timezone` | no | IANA timezone, e.g. `America/New_York`; otherwise host timezone |
-| `enabled` | no | Defaults to `true` |
+| `id` | Yes | Stable 1–40 character plan identity; never derive it from array position |
+| `name` | Yes | Human label |
+| `fromToken` | Yes | Must be `USDC` in this fixed-dollar reference |
+| `toToken` | Yes | Non-USDC asset to acquire |
+| `amount` | Yes | USDC per scheduled economic action |
+| `chain` | Yes | Chain used for the executable quote |
+| `schedule` | Yes | 5-field cron; minute must be one literal `0`–`59`, so cadence is no faster than hourly |
+| `timezone` | No | IANA zone; defaults to `UTC` rather than host-local time |
+| `maxGasUsd` | Yes | Maximum quote gas estimate this plan may promote |
+| `enabled` | No | Defaults to `true` |
 
-Despite the strategy name, `amount` is not inherently USD. `amount: 50` with `fromToken: "USDC"` means 50 USDC; with `fromToken: "ETH"` it means 50 ETH. A classic dollar-cost-averaging plan normally uses a dollar stablecoin as the source token.
+`SUWAPPU_MAX_DCA_USDC` is an independent per-action client ceiling and defaults to `1000`. A plan over the cap, a missing/invalid gas ceiling, non-USDC source, invalid timezone, duplicate/unstable ID, sub-hour cron, malformed quote, missing gas estimate, or nearly expired quote fails closed.
 
-Duplicate plan ids are rejected. If a scheduled callback is still running when the same plan triggers again, the overlapping run is skipped.
+Client limits are defense in depth. Configure restrictive managed-wallet policies for durable asset/spend controls.
 
-The every-minute expression `* * * * *` is disabled by this example. For real recurring execution, choose a deliberate cadence and configure server-side wallet policy limits as the durable safety boundary.
+## One schedule slot = one economic action
 
-## One-off preview
+At each cron trigger the scheduler computes an action key from the plan's **local wall-clock minute**. For example:
 
-```bash
-bun src/index.ts run-once \
-  --from USDC \
-  --to ETH \
-  --amount 50 \
-  --chain base
+```text
+plan: daily-eth
+timezone: America/New_York
+slot: 2026-11-01 01:30
+action: schedule.20261101T0130
 ```
 
-This obtains and records a quote but does not submit it.
+If the 01:30 wall-clock hour repeats during the daylight-saving fallback, both callbacks resolve to the same action key. The durable journal therefore cannot turn that repeated wall-clock slot into two DCA economic actions.
+
+The scheduler intentionally does not backfill a slot it completely missed while offline. Production catch-up policy is a product decision; adding an automatic “buy everything we missed” loop is not a safe default.
+
+## Preview and cost guard
+
+Preview mode requests the real chain route but stops before simulation/submission. It records:
+
+- requested USDC amount;
+- quote ID and optimistic/minimum output;
+- estimated gas and the plan ceiling;
+- reported route-fee attribution;
+- plan/action identity.
+
+A route is previewable/promotable only when gas is present, `estimated_gas_usd <= maxGasUsd`, and more than five seconds of quote TTL remain. `amount_out_min` is retained because minimum output—not optimistic output—is the useful execution bound.
 
 ## Enabling managed DCA
 
-Set the intended managed wallet and the independent environment opt-in, then pass `--execute`:
+Set the intended wallet and the independent live environment gate, then add `--execute`:
 
 ```bash
 export SUWAPPU_WALLET_ADDRESS=0x...
 export SUWAPPU_ALLOW_MANAGED_EXECUTION=1
+export SUWAPPU_MAX_DCA_USDC=100
 
-# Scheduled live mode
 bun src/index.ts start --execute
+```
 
-# One explicitly requested live run
+For each new scheduled action, the managed path:
+
+1. persists the exact plan/action/economic terms;
+2. obtains a fresh wallet-aware quote and applies the gas/TTL guard;
+3. calls `/swap/simulate` and requires **`would_execute: true`**;
+4. persists `submitting` before the network request;
+5. sends the durable intent ID as `Idempotency-Key` to `/swap/execute`;
+6. records a known swap ID and reconciles `/swap/status/:id` once per minute while the scheduler is running;
+7. stores terminal status and final amounts when available.
+
+An HTTP-successful simulation can still say `would_execute: false`. That is a block, not permission.
+
+### Ambiguous execution never becomes a fresh installment
+
+A timeout, dropped connection after write, 5xx, or malformed successful execute response can mean the transaction happened but its response was lost. The scheduler records `outcome_unknown`.
+
+If the next scheduled trigger finds any `prepared`, `submitting`, `submitted`, or `outcome_unknown` action for that plan, the old action wins. The scheduler recovers/reconciles it and conservatively skips the new installment. An ambiguous action without a swap ID gets a fresh same-terms quote + simulation and retries using the **same** idempotency key.
+
+This is intentionally stricter than “cron fired, therefore buy again.”
+
+## One-off actions
+
+`run-once` is preview-only unless the same two live gates are present:
+
+```bash
 bun src/index.ts run-once \
-  --from USDC \
   --to ETH \
   --amount 50 \
   --chain base \
+  --max-gas-usd 2
+
+# Explicit managed version:
+bun src/index.ts run-once \
+  --to ETH \
+  --amount 50 \
+  --chain base \
+  --max-gas-usd 2 \
   --execute
 ```
 
-Each live trigger:
+Manual actions share one `manual` recovery lane. If a previous manual submit is unresolved, a later manual command recovers it instead of silently creating a second action.
 
-1. gets a fresh quote with `wallet_address`;
-2. simulates the quote for that wallet;
-3. requires `success: true`;
-4. sends the quote id to `POST /v1/agent/swap/execute`;
-5. records the managed `swap_id`, status, and transaction hash when available.
+## Durable history and reconciliation
 
-The API may accept a managed swap before a transaction hash exists; use swap status/history in larger systems instead of treating “hash pending” as failure.
+```bash
+bun src/index.ts history
+bun src/index.ts history --reconcile
+```
+
+The journal distinguishes `preview`, `prepared`, `submitting`, `submitted`, `completed`, `failed`, and `outcome_unknown`. `--reconcile` polls known swap IDs only; it never quotes or submits.
+
+By default the journal is `~/.suwappu-dca/execution-journal.json`; override its directory with `SUWAPPU_DCA_STATE_DIR`. Writes are atomic. Do not delete unresolved records to “unstick” a plan: losing an idempotency key can turn recovery into a second economic action.
+
+This local journal assumes one process owns the state directory. Before horizontal scaling, move intents to transactional durable storage with uniqueness/locking around plan/action keys.
 
 ## Commands
 
 | Command | Purpose |
 |---|---|
-| `start` | Run all enabled schedules; preview by default |
-| `status` | Show plan amounts, schedules, and timezones |
-| `history` | Show preview/submitted/failed outcomes |
-| `run-once` | Preview one buy; add `--execute` for managed submission |
+| `start` | Validate and schedule all enabled plans; preview by default |
+| `status` | Validate/show plan amount, cadence, timezone, gas ceiling, enabled state |
+| `history` | Show the durable action journal; optional read-only reconciliation |
+| `run-once` | Preview one fixed-USDC action; add `--execute` for managed submission |
 
-## Current SDK publication boundary
+## Suwappu authority boundary
 
-The npm package is currently `@suwappu/sdk@0.4.0`, while the Suwappu repository already contains newer 0.6 TypeScript SDK source. The older package's swap execution helper targets the previous execution contract, so this example uses a small typed adapter in `src/suwappu.ts` for today's production endpoints instead of claiming an unpublished SDK.
+`src/suwappu.ts` is a small typed adapter over the production quote, simulation, managed execute, and status contracts this example actually needs. That keeps the example independent of registry-release timing while still making the API boundary explicit.
 
-The newer SDK source expresses the same distinction directly:
+Suwappu's hosted MCP endpoint is `https://api.suwappu.bot/mcp`. Its historically named `execute_swap` flow prepares an unsigned/self-custody transaction; it is not the managed `/swap/execute` endpoint used by this scheduler. Keep “prepare for a wallet to sign” separate from “submit from a managed wallet.”
 
-```text
-getQuote({ ..., walletAddress })
-  → simulateSwap({ quoteId, walletAddress })
-  → swap(quote)                         # managed execution
+## How this stacks up
 
-prepareSwap({ quoteId, walletAddress }) # unsigned/self-custody
-```
+This repository should stay a small Suwappu recurring-action reference.
 
-The hosted MCP endpoint is `https://api.suwappu.bot/mcp`. Its `execute_swap` tool prepares an unsigned/self-custody transaction; it is not the managed execution step used by this scheduler.
-
-## Environment
-
-| Variable | Required | Purpose |
+| Project | What it demonstrates | What builders should copy |
 |---|---|---|
-| `SUWAPPU_API_KEY` | Yes | Agent authentication |
-| `SUWAPPU_WALLET_ADDRESS` | Managed mode | Wallet bound to quote + simulation |
-| `SUWAPPU_ALLOW_MANAGED_EXECUTION` | Managed mode | Must equal `1` in addition to `--execute` |
-| `SUWAPPU_API_URL` | No | API base override for development |
+| This repository | Scheduled fixed-USDC Suwappu actions with durable recovery | plan/slot identity, cost gate, permission, idempotency, reconciliation |
+| [Hummingbot DCAExecutor](https://hummingbot.org/strategies/v2-strategies/executors/dcaexecutor/) | A DCA Executor with its own order/execution lifecycle | Move to an executor/controller architecture when one recurring swap becomes multi-order strategy state |
+| [Freqtrade position adjustment](https://www.freqtrade.io/en/stable/strategy-callbacks/) | DCA-style position adjustment inside a full strategy system | Use strict re-entry logic/limits; its docs explicitly warn loose logic can place repeated entries very quickly |
 
-Prefer `SUWAPPU_API_KEY` over putting credentials into the JSON config.
-
-## Installation note
-
-This example repository is not currently published as an npm package. Clone it and run it with Bun as shown above.
+Suwappu is the financial action plane here. Use a deeper trading framework when the problem becomes strategy research, position lifecycle, exits, or many-order orchestration.
 
 ## Develop
 
@@ -173,13 +220,17 @@ bun run typecheck
 bun test
 ```
 
-CI uses Bun 1.3.14, a frozen lockfile, blocking typecheck, and regression tests.
+CI uses Bun 1.3.14, a frozen lockfile, blocking typecheck, and regression tests for schedule identity, caps/gas, `would_execute`, durable journal corruption, same-key ambiguous retry, known-swap reconciliation, and final amounts.
 
 ## Build further
 
+- [Turn recurring execution into a product](BUILDING_A_PRODUCT.md)
 - [Suwappu docs](https://docs.suwappu.bot)
+- [Managed wallets](https://docs.suwappu.bot/guides/managed-wallets)
+- [Strategy lifecycle](https://docs.suwappu.bot/guides/strategy-lifecycle)
 - [SDK source](https://github.com/0xSoftBoi/suwappubot/tree/main/packages/sdk)
-- [Agent/MCP docs](https://github.com/0xSoftBoi/suwappubot/blob/main/docs/agent-clients.md)
+
+Discover supported chains/tokens at runtime instead of hard-coding a chain/provider count that will go stale.
 
 ## License
 

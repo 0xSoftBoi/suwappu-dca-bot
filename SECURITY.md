@@ -1,42 +1,51 @@
 # Security Policy
 
-This repository is a satellite / example application built on the
-[Suwappu API](https://github.com/0xSoftBoi/suwappubot). Some examples can
-initiate real financial transactions when execution is enabled. Treat API keys,
-wallet credentials, and configuration as sensitive.
+This repository is a Suwappu recurring-action reference. It is preview-only by default and can submit real managed-wallet swaps only after explicit opt-in.
 
-## Reporting a vulnerability
+## Report a vulnerability
 
-**Do not open a public issue for security reports.** Instead:
+Do not open a public issue for security reports. Use GitHub Private Vulnerability Reporting when enabled for this repository, or email **security@suwappu.bot**.
 
-- Use **GitHub Private Vulnerability Reporting** when it is enabled for this repository, or
-- Email **security@suwappu.bot**.
+Include the affected file/version, reproduction steps, and impact. Vulnerabilities in the Suwappu API, shared SDKs, contracts, custody layer, or core bot should be reported through the [core security policy](https://github.com/0xSoftBoi/suwappubot/security/policy).
 
-Please include the affected file, version or commit, reproduction steps, and an
-impact assessment.
+## Money-moving invariants
 
-**Scope note:** issues in this repository's own code, SDK usage, dependencies,
-or CI belong here. Vulnerabilities in the Suwappu API, core bot, smart
-contracts, custody/key-management layer, or shared SDK should be reported
-upstream through the
-[core security policy](https://github.com/0xSoftBoi/suwappubot/security/policy).
+Changes to managed DCA should preserve all of these properties:
 
-## Custody and execution model
+- preview remains the default;
+- live submission requires both `--execute` and `SUWAPPU_ALLOW_MANAGED_EXECUTION=1`;
+- the reference accepts fixed USDC input and enforces `SUWAPPU_MAX_DCA_USDC`;
+- each plan has a stable ID, deterministic schedule-slot identity, explicit timezone, and no sub-hour cadence;
+- the route must include valid minimum output, useful TTL, and estimated gas at/below `maxGasUsd`;
+- `/swap/simulate` must explicitly return `would_execute: true`;
+- a durable intent/idempotency key exists before submission becomes ambiguous;
+- retries of one economic action reuse that exact key;
+- network/timeout/5xx ambiguity is `outcome_unknown`, never assumed failure;
+- an unresolved action blocks a fresh installment for that plan until recovery/reconciliation;
+- known swap IDs are reconciled without resubmission;
+- final amounts remain distinct from quoted amounts;
+- client controls supplement server-side wallet policies.
 
-Suwappu supports both self-custody and custodial product flows. This satellite
-repository does not make a custody guarantee: behavior depends on the API mode
-and configuration in use. Prefer dry-run or read-only modes where available,
-use test wallets before enabling execution, and never commit credentials.
+Add regression coverage when changing any of these invariants.
 
-## Our commitment
+## Durable state is part of the safety boundary
 
-- **Acknowledge** reports within 3 business days.
-- **Triage and severity** within 7 business days.
-- **Coordinate disclosure** with the reporter and provide credit unless
-  anonymity is requested.
+The scheduler stores `execution-journal.json` under `~/.suwappu-dca` by default. Override the directory with `SUWAPPU_DCA_STATE_DIR` when you can guarantee durable storage.
 
-## Safe harbor
+Do not delete or truncate unresolved `prepared`, `submitting`, `submitted`, or `outcome_unknown` records as a retry mechanism. Losing an idempotency key can turn one scheduled economic action into two.
 
-Good-faith research conducted under this policy, without privacy violations,
-data destruction, or service degradation, will not result in legal action from
-us. If in doubt, contact us before testing.
+The JSON journal has atomic writes but is intentionally single-writer. Do not run multiple scheduler replicas against the same local state directory. Use transactional storage, uniqueness constraints, and concurrency control before horizontal scale.
+
+## Credentials and wallets
+
+- The plan file does not load API credentials; keep secrets in environment/secret management.
+- Never commit `.env`, API keys, private keys, or wallet credentials.
+- Use a dedicated wallet and least-privileged Suwappu identity while developing.
+- Put restrictive server-side wallet policies around assets and spend before managed mode.
+- Rotate exposed credentials immediately.
+
+## Coordinated disclosure
+
+We aim to acknowledge reports within 3 business days, triage severity within 7 business days, coordinate disclosure with the reporter, and provide credit unless anonymity is requested.
+
+Good-faith research conducted without privacy violations, data destruction, or service degradation is covered by our safe-harbor intent. If in doubt, contact us before testing live infrastructure.
