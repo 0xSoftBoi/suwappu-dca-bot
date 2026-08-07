@@ -1,12 +1,27 @@
 #!/usr/bin/env bun
-import { Command } from "commander";
 import chalk from "chalk";
+import { Command } from "commander";
 import ora from "ora";
-import { loadConfig } from "./config.js";
-import { DCAEngine } from "./dca.js";
-import { resolveExecutionMode } from "./execution.js";
+import {
+  DEFAULT_MAX_DCA_USDC,
+  loadConfig,
+  validatePlan,
+  type DCAPlan,
+} from "./config.js";
+import { DCAEngine, manualActionKey } from "./dca.js";
+import { resolveExecutionMode, type ExecutionIntent } from "./execution.js";
 
 const program = new Command();
+
+function requireApiKey(): string {
+  const apiKey = process.env.SUWAPPU_API_KEY;
+  if (!apiKey) {
+    throw new Error(
+      "SUWAPPU_API_KEY is not set. Register an agent at https://api.suwappu.bot/v1/agent/register",
+    );
+  }
+  return apiKey;
+}
 
 function cliExecutionMode(execute: boolean) {
   return resolveExecutionMode({
@@ -16,156 +31,172 @@ function cliExecutionMode(execute: boolean) {
   });
 }
 
+function phaseLabel(intent: ExecutionIntent): string {
+  switch (intent.phase) {
+    case "completed": return chalk.green("COMPLETED");
+    case "preview": return chalk.cyan("PREVIEW");
+    case "submitted": return chalk.yellow("SUBMITTED");
+    case "outcome_unknown": return chalk.bgRed.white("OUTCOME UNKNOWN");
+    case "failed": return chalk.red("FAILED");
+    default: return chalk.yellow(intent.phase.toUpperCase());
+  }
+}
+
+function printIntent(intent: ExecutionIntent): void {
+  console.log(
+    `  ${intent.createdAt}  ${phaseLabel(intent)}  ${intent.terms.amount} USDC → ${intent.terms.toToken} (${intent.terms.chain})`,
+  );
+  console.log(`    Plan/action: ${intent.planId} / ${intent.actionKey}`);
+  if (intent.quoteId) console.log(`    Quote: ${intent.quoteId}`);
+  if (intent.quotedToAmountMin) {
+    console.log(`    Quoted minimum: ${intent.quotedToAmountMin} ${intent.terms.toToken}`);
+  }
+  if (intent.estimatedGasUsd !== undefined) {
+    console.log(`    Estimated gas: $${intent.estimatedGasUsd} / max $${intent.maxGasUsd}`);
+  }
+  if (intent.swapId) console.log(`    Swap: ${intent.swapId} (${intent.swapStatus ?? "status pending"})`);
+  if (intent.txHash) console.log(`    TX: ${intent.txHash}`);
+  if (intent.actualToAmount) {
+    console.log(`    Final: ${intent.actualFromAmount ?? "?"} USDC → ${intent.actualToAmount} ${intent.terms.toToken}`);
+  }
+  if (intent.error) console.log(`    Note: ${intent.error}`);
+}
+
 program
   .name("suwappu-dca")
-  .description("Preview-first DCA scheduler using Suwappu")
-  .version("1.0.0");
+  .description("Outcome-safe fixed-USDC DCA scheduler using Suwappu")
+  .version("1.1.0");
 
 program
   .command("start")
-  .description("Start the DCA scheduler (preview-only unless --execute is explicitly enabled)")
+  .description("Start configured DCA schedules (preview-only unless --execute is explicitly enabled)")
   .option("-c, --config <path>", "Config file path")
   .option("--execute", "Enable managed-wallet swap submission", false)
   .action(async (opts) => {
     const config = loadConfig(opts.config);
     const mode = cliExecutionMode(Boolean(opts.execute));
     const engine = new DCAEngine(config.apiKey, mode);
-
     for (const plan of config.plans) engine.addPlan(plan);
 
-    console.log(chalk.bold("DCA Bot Started"));
-    console.log(chalk.dim("─".repeat(40)));
+    console.log(chalk.bold("Suwappu DCA Scheduler"));
+    console.log(chalk.dim("─".repeat(50)));
     console.log(
       mode.kind === "managed"
-        ? chalk.yellow("  Mode: MANAGED EXECUTION (each quote is simulated first)")
-        : chalk.green("  Mode: PREVIEW (quotes only; no transactions submitted)"),
+        ? chalk.yellow("  Mode: MANAGED (durable intent → simulate → idempotent submit → reconcile)")
+        : chalk.green("  Mode: PREVIEW (quote + cost guard only; no submission)"),
     );
-
+    console.log(`  Per-action ceiling: ${process.env.SUWAPPU_MAX_DCA_USDC ?? DEFAULT_MAX_DCA_USDC} USDC`);
     for (const plan of config.plans) {
       console.log(
-        `  ${chalk.cyan(plan.name)}: ${plan.amount} ${plan.fromToken} → ${plan.toToken} on ${plan.chain}`,
+        `  ${chalk.cyan(plan.name)}: ${plan.amount} USDC → ${plan.toToken} on ${plan.chain}`,
       );
-      console.log(`    Schedule: ${plan.schedule}`);
-      console.log(`    Timezone: ${plan.timezone ?? "host default"}`);
+      console.log(
+        `    ${plan.schedule} ${plan.timezone} | max gas $${plan.maxGasUsd} | ${plan.enabled ? "enabled" : "disabled"}`,
+      );
     }
     console.log(chalk.dim("\nPress Ctrl+C to stop.\n"));
 
     engine.start();
+    const shutdown = () => {
+      engine.stop();
+      process.exit(0);
+    };
+    process.once("SIGINT", shutdown);
+    process.once("SIGTERM", shutdown);
     await new Promise(() => {});
   });
 
 program
   .command("status")
-  .description("Show configured DCA plans")
+  .description("Validate and show configured DCA plans")
   .option("-c, --config <path>", "Config file path")
   .action((opts) => {
     const config = loadConfig(opts.config);
-
     console.log(chalk.bold("DCA Plans"));
-    console.log(chalk.dim("─".repeat(50)));
-
+    console.log(chalk.dim("─".repeat(60)));
     for (const plan of config.plans) {
-      console.log(`  ${chalk.cyan(plan.name)}`);
-      console.log(`    ${plan.fromToken} → ${plan.toToken}: ${plan.amount} ${plan.fromToken}`);
-      console.log(`    Chain: ${plan.chain}`);
-      console.log(`    Schedule: ${plan.schedule}`);
-      console.log(`    Timezone: ${plan.timezone ?? "host default"}`);
-      console.log(
-        `    Enabled: ${plan.enabled !== false ? chalk.green("yes") : chalk.red("no")}`,
-      );
+      console.log(`  ${chalk.cyan(plan.name)} (${plan.id})`);
+      console.log(`    ${plan.amount} USDC → ${plan.toToken} on ${plan.chain}`);
+      console.log(`    Schedule: ${plan.schedule} | timezone: ${plan.timezone}`);
+      console.log(`    Max gas: $${plan.maxGasUsd}`);
+      console.log(`    Enabled: ${plan.enabled ? chalk.green("yes") : chalk.red("no")}`);
       console.log();
     }
   });
 
 program
   .command("history")
-  .description("Show DCA preview/submission history")
-  .option("-c, --config <path>", "Config file path")
+  .description("Show the durable DCA action journal")
   .option("-n, --limit <count>", "Number of entries", "20")
-  .action((opts) => {
-    const config = loadConfig(opts.config);
-    const engine = new DCAEngine(config.apiKey);
-    const history = engine.getHistory();
-
+  .option("--reconcile", "Poll known swap IDs before printing; never submit", false)
+  .action(async (opts) => {
+    const limit = Number.parseInt(opts.limit, 10);
+    if (!Number.isInteger(limit) || limit <= 0) throw new Error("--limit must be a positive integer");
+    const engine = new DCAEngine(requireApiKey());
+    const history = opts.reconcile
+      ? (await engine.reconcileHistory()).slice(0, limit)
+      : engine.getHistory(limit);
     if (history.length === 0) {
-      console.log(chalk.dim("No DCA history yet."));
+      console.log(chalk.dim("No DCA actions recorded."));
       return;
     }
-
-    const limit = Number.parseInt(opts.limit, 10);
-    if (!Number.isInteger(limit) || limit <= 0) {
-      throw new Error("--limit must be a positive integer");
-    }
-
-    console.log(chalk.bold("DCA History"));
-    console.log(chalk.dim("─".repeat(60)));
-
-    for (const entry of history.slice(-limit)) {
-      const status =
-        entry.outcome === "submitted"
-          ? chalk.green("SUBMITTED")
-          : entry.outcome === "preview"
-            ? chalk.cyan("PREVIEW")
-            : chalk.red("FAILED");
-      console.log(
-        `  ${entry.timestamp}  ${status}  ${entry.amount} ${entry.fromToken} → ${entry.toToken} (${entry.chain})`,
-      );
-      if (entry.quoteId) console.log(`    Quote: ${entry.quoteId}`);
-      if (entry.toAmount) console.log(`    Quoted output: ${entry.toAmount} ${entry.toToken}`);
-      if (entry.swapId) console.log(`    Swap: ${entry.swapId}`);
-      if (entry.txHash) console.log(`    TX: ${entry.txHash}`);
-      if (entry.error) console.log(`    Error: ${entry.error}`);
-    }
+    console.log(chalk.bold("DCA Action Journal"));
+    console.log(chalk.dim("─".repeat(70)));
+    for (const intent of history) printIntent(intent);
   });
 
 program
   .command("run-once")
-  .description("Preview one DCA buy; pass --execute for managed submission")
-  .option("-c, --config <path>", "Config file path")
-  .requiredOption("--from <token>", "Source token")
+  .description("Preview one fixed-USDC DCA action; pass --execute for managed submission")
+  .option("--from <token>", "Source token; this reference accepts USDC only", "USDC")
   .requiredOption("--to <token>", "Target token")
-  .requiredOption("--amount <amount>", "Source-token amount")
-  .requiredOption("--chain <chain>", "Chain to execute on")
+  .requiredOption("--amount <amount>", "USDC amount")
+  .requiredOption("--chain <chain>", "Chain to quote/execute on")
+  .requiredOption("--max-gas-usd <usd>", "Maximum estimated gas for this action")
   .option("--execute", "Enable managed-wallet swap submission", false)
   .action(async (opts) => {
-    const amount = Number.parseFloat(opts.amount);
-    if (!Number.isFinite(amount) || amount <= 0) {
-      throw new Error("--amount must be a positive source-token amount");
-    }
-
-    const config = loadConfig(opts.config);
-    const mode = cliExecutionMode(Boolean(opts.execute));
-    const engine = new DCAEngine(config.apiKey, mode);
-    const spinner = ora(
-      mode.kind === "managed"
-        ? `Simulating then submitting ${amount} ${opts.from} → ${opts.to}...`
-        : `Previewing ${amount} ${opts.from} → ${opts.to}...`,
-    ).start();
-
-    const result = await engine.executeBuy({
+    const amount = Number(opts.amount);
+    const maxGasUsd = Number(opts.maxGasUsd);
+    const plan = validatePlan({
       id: "manual",
-      name: "Manual Buy",
+      name: "Manual DCA Action",
       fromToken: opts.from,
       toToken: opts.to,
       amount,
       chain: opts.chain,
-      schedule: "",
-    });
+      schedule: "0 * * * *",
+      timezone: "UTC",
+      maxGasUsd,
+      enabled: true,
+    }, "manual action");
+    const mode = cliExecutionMode(Boolean(opts.execute));
+    const engine = new DCAEngine(requireApiKey(), mode);
+    const spinner = ora(
+      mode.kind === "managed"
+        ? `Running durable managed action for ${plan.amount} USDC → ${plan.toToken}...`
+        : `Previewing ${plan.amount} USDC → ${plan.toToken}...`,
+    ).start();
+    const result = await engine.executeBuy(plan, manualActionKey());
 
-    if (result.outcome === "preview") {
+    if (result.phase === "preview") {
       spinner.succeed(
         chalk.green(
-          `Preview: ${amount} ${opts.from} → ${result.toAmount ?? "?"} ${opts.to} (no transaction submitted)`,
+          `Preview: ${plan.amount} USDC → min ${result.quotedToAmountMin ?? "?"} ${plan.toToken} (no submission)`,
         ),
       );
-    } else if (result.outcome === "submitted") {
+    } else if (result.phase === "completed") {
       spinner.succeed(
         chalk.green(
-          `Submitted swap ${result.swapId ?? "unknown"} — TX: ${result.txHash ?? "pending"}`,
+          `Completed swap ${result.swapId ?? "unknown"}: ${result.actualToAmount ?? "?"} ${result.terms.toToken}`,
         ),
       );
+    } else if (result.phase === "submitted") {
+      spinner.succeed(chalk.yellow(`Submitted swap ${result.swapId ?? "unknown"}; reconcile to terminal status.`));
+    } else if (result.phase === "outcome_unknown") {
+      spinner.fail(chalk.red(`Outcome unknown: ${result.error ?? "do not create a fresh economic action"}`));
+      process.exitCode = 2;
     } else {
-      spinner.fail(chalk.red(`Failed: ${result.error}`));
+      spinner.fail(chalk.red(`Failed safely: ${result.error ?? result.phase}`));
       process.exitCode = 1;
     }
   });

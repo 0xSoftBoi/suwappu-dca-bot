@@ -8,7 +8,8 @@
       "amount": 50,
       "chain": "base",
       "schedule": "0 9 * * *",
-      "timezone": "America/New_York"
+      "timezone": "America/New_York",
+      "maxGasUsd": 2
     },
     {
       "id": "weekly-sol",
@@ -18,7 +19,8 @@
       "amount": 100,
       "chain": "solana",
       "schedule": "0 9 * * 1",
-      "timezone": "UTC"
+      "timezone": "UTC",
+      "maxGasUsd": 2
     }
   ]
 }
