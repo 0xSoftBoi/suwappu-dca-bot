@@ -23,7 +23,7 @@
   "keywords": ["suwappu", "dca", "dollar-cost-averaging", "defi", "trading", "bot"],
   "author": "Suwappu",
   "dependencies": {
-    "chalk": "5.6.2",
+    "chalk": "6.0.0",
     "commander": "12.1.0",
     "node-cron": "4.6.0",
     "ora": "8.2.0"
