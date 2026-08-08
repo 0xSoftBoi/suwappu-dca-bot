@@ -47,6 +47,8 @@ Track product metrics such as:
 - spend-policy/cap rejections (a control signal, not merely an error);
 - support/operator interventions per 100 scheduled actions.
 
+For a preview-first product, define activation as an attributable product action such as **saved plan -> first route-qualified scheduled preview**. Keep visits, stars, signups, and generic API traffic separate from activation. For managed automation, track a second milestone: **explicitly opted-in plan -> first terminal reconciled action**.
+
 ## Request economics are naturally bounded
 
 Unlike a price-polling strategy, a DCA scheduler does not need to ask for a price every few seconds. Each due preview normally needs one quote. A new managed action adds simulation + execute and then status polling until terminal.
@@ -60,6 +62,19 @@ ambiguous recovery ≈ fresh same-terms quote + simulation + same-key retry
 ```
 
 Use the current Suwappu pricing/rate-limit documentation for real unit costs; do not freeze copied prices into your business model.
+
+Model it per paid plan before scaling:
+
+```text
+monthly plan contribution margin
+= allocated plan revenue
+- (due previews × measured quote cost)
+- (managed actions × measured simulate/execute cost)
+- reconciliation reads
+- allocated hosting/database/notification/support/payment cost
+```
+
+Run this from observed calls and invoices. “A DCA plan exists” is not a margin model, and token appreciation is not builder revenue.
 
 ## Separate builder economics from customer investment performance
 
@@ -93,6 +108,19 @@ Examples to test:
 - team tier for approvals, roles, shared budgets, and exports;
 - usage tier for higher action/reconciliation volume;
 - vertical treasury automation when recurring purchases are part of a larger operational workflow.
+
+Good paid fences map to product capability rather than expected returns:
+
+| Fence | Free / entry experience | Paid reason |
+|---|---|---|
+| Saved plans | small number of preview plans | more independent recurring workflows |
+| Notifications | basic in-app/history | delivery channels, escalation, quiet hours |
+| Approval | personal confirmation | team roles, multi-step approvals, audit export |
+| Automation | preview/approval first | bounded managed execution with reconciliation |
+| History | recent operator view | longer retention, export, accounting integration |
+| Operations | community/self-serve | support, SSO/RBAC, controls, reporting |
+
+Do not sell a “higher-return” tier. The paid object is automation, control, history, collaboration, and operating assurance.
 
 The Agent API does not imply a generic third-party `builder_fee`. Charge customers explicitly through your own product/billing contract unless a documented Suwappu attribution mechanism applies to your specific surface.
 
@@ -141,6 +169,23 @@ Show quoted and final amounts separately. Let a customer answer:
 - what were the reconciled final amounts?
 
 The audit trail is a product feature, not just debugging data.
+
+## Enterprise graduation checklist
+
+The v2 repository gives one local process strong operating invariants; it is not itself a multi-tenant control plane. Before calling a hosted service enterprise-ready, graduate each boundary deliberately:
+
+- tenant-isolated transactional state with a uniqueness constraint on tenant + plan + schedule slot;
+- durable job/reconciliation queues with distributed serialization and idempotency evidence across deploys;
+- tenant-scoped credentials, server-side wallet policy, secret rotation, and explicit environment separation;
+- RBAC/SSO as needed, auditable plan/live-mode changes, and re-approval for material budget/asset changes;
+- per-tenant and per-period budgets in addition to per-action caps;
+- metrics/alerts for duplicate actions, ambiguity age, reconciliation lag, rate limits, and provider failures;
+- backup/restore drills and a documented recovery-time/data-loss objective for execution state;
+- release/change control for money-path code plus dependency scanning and security response ownership;
+- usage metering/billing that can explain every charged unit and preserve customer strategy P&L separately;
+- customer-visible export/audit records that distinguish requested, quoted, submitted, and reconciled facts.
+
+The local [operations runbook](docs/OPERATIONS.md) is the seed for that operating model; replace its local lock/storage primitives when you add hosts or tenants rather than pretending they scale horizontally.
 
 ## Know when this repo is no longer enough
 

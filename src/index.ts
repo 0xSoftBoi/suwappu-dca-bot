@@ -9,15 +9,22 @@ import {
   type DCAPlan,
 } from "./config.js";
 import { DCAEngine, manualActionKey } from "./dca.js";
-import { resolveExecutionMode, type ExecutionIntent } from "./execution.js";
+import {
+  acquireExecutionLock,
+  listExecutionJournal,
+  reconcileExecutionJournal,
+  resolveExecutionMode,
+  type ExecutionIntent,
+} from "./execution.js";
+import { operationTimeoutMs } from "./suwappu.js";
 
 const program = new Command();
 
 function requireApiKey(): string {
   const apiKey = process.env.SUWAPPU_API_KEY;
-  if (!apiKey) {
+  if (!apiKey || apiKey !== apiKey.trim()) {
     throw new Error(
-      "SUWAPPU_API_KEY is not set. Register an agent at https://api.suwappu.bot/v1/agent/register",
+      "SUWAPPU_API_KEY must be a non-empty value without surrounding whitespace. Register an agent at https://api.suwappu.bot/v1/agent/register",
     );
   }
   return apiKey;
@@ -65,7 +72,7 @@ function printIntent(intent: ExecutionIntent): void {
 program
   .name("suwappu-dca")
   .description("Outcome-safe fixed-USDC DCA scheduler using Suwappu")
-  .version("1.1.0");
+  .version("2.0.0");
 
 program
   .command("start")
@@ -74,36 +81,46 @@ program
   .option("--execute", "Enable managed-wallet swap submission", false)
   .action(async (opts) => {
     const config = loadConfig(opts.config);
+    const apiKey = requireApiKey();
+    operationTimeoutMs();
     const mode = cliExecutionMode(Boolean(opts.execute));
-    const engine = new DCAEngine(config.apiKey, mode);
+    const engine = new DCAEngine(apiKey, mode);
     for (const plan of config.plans) engine.addPlan(plan);
+    const releaseLock = acquireExecutionLock();
 
-    console.log(chalk.bold("Suwappu DCA Scheduler"));
-    console.log(chalk.dim("─".repeat(50)));
-    console.log(
-      mode.kind === "managed"
-        ? chalk.yellow("  Mode: MANAGED (durable intent → simulate → idempotent submit → reconcile)")
-        : chalk.green("  Mode: PREVIEW (quote + cost guard only; no submission)"),
-    );
-    console.log(`  Per-action ceiling: ${process.env.SUWAPPU_MAX_DCA_USDC ?? DEFAULT_MAX_DCA_USDC} USDC`);
-    for (const plan of config.plans) {
+    try {
+      console.log(chalk.bold("Suwappu DCA Scheduler"));
+      console.log(chalk.dim("─".repeat(50)));
       console.log(
-        `  ${chalk.cyan(plan.name)}: ${plan.amount} USDC → ${plan.toToken} on ${plan.chain}`,
+        mode.kind === "managed"
+          ? chalk.yellow("  Mode: MANAGED (durable intent → simulate → idempotent submit → reconcile)")
+          : chalk.green("  Mode: PREVIEW (quote + cost guard only; no submission)"),
       );
-      console.log(
-        `    ${plan.schedule} ${plan.timezone} | max gas $${plan.maxGasUsd} | ${plan.enabled ? "enabled" : "disabled"}`,
-      );
-    }
-    console.log(chalk.dim("\nPress Ctrl+C to stop.\n"));
+      console.log(`  Per-action ceiling: ${process.env.SUWAPPU_MAX_DCA_USDC ?? DEFAULT_MAX_DCA_USDC} USDC`);
+      for (const plan of config.plans) {
+        console.log(
+          `  ${chalk.cyan(plan.name)}: ${plan.amount} USDC → ${plan.toToken} on ${plan.chain}`,
+        );
+        console.log(
+          `    ${plan.schedule} ${plan.timezone} | max gas $${plan.maxGasUsd} | ${plan.enabled ? "enabled" : "disabled"}`,
+        );
+      }
+      console.log(chalk.dim("\nPress Ctrl+C to stop.\n"));
 
-    engine.start();
-    const shutdown = () => {
+      engine.start();
+      const shutdown = () => {
+        engine.stop();
+        releaseLock();
+        process.exit(0);
+      };
+      process.once("SIGINT", shutdown);
+      process.once("SIGTERM", shutdown);
+      await new Promise(() => {});
+    } catch (error) {
       engine.stop();
-      process.exit(0);
-    };
-    process.once("SIGINT", shutdown);
-    process.once("SIGTERM", shutdown);
-    await new Promise(() => {});
+      releaseLock();
+      throw error;
+    }
   });
 
 program
@@ -132,10 +149,19 @@ program
   .action(async (opts) => {
     const limit = Number.parseInt(opts.limit, 10);
     if (!Number.isInteger(limit) || limit <= 0) throw new Error("--limit must be a positive integer");
-    const engine = new DCAEngine(requireApiKey());
-    const history = opts.reconcile
-      ? (await engine.reconcileHistory()).slice(0, limit)
-      : engine.getHistory(limit);
+    let history: ExecutionIntent[];
+    if (opts.reconcile) {
+      const apiKey = requireApiKey();
+      operationTimeoutMs();
+      const releaseLock = acquireExecutionLock();
+      try {
+        history = (await reconcileExecutionJournal(apiKey)).slice(0, limit);
+      } finally {
+        releaseLock();
+      }
+    } else {
+      history = listExecutionJournal(limit);
+    }
     if (history.length === 0) {
       console.log(chalk.dim("No DCA actions recorded."));
       return;
@@ -170,13 +196,21 @@ program
       enabled: true,
     }, "manual action");
     const mode = cliExecutionMode(Boolean(opts.execute));
-    const engine = new DCAEngine(requireApiKey(), mode);
+    const apiKey = requireApiKey();
+    operationTimeoutMs();
+    const engine = new DCAEngine(apiKey, mode);
     const spinner = ora(
       mode.kind === "managed"
         ? `Running durable managed action for ${plan.amount} USDC → ${plan.toToken}...`
         : `Previewing ${plan.amount} USDC → ${plan.toToken}...`,
     ).start();
-    const result = await engine.executeBuy(plan, manualActionKey());
+    const releaseLock = acquireExecutionLock();
+    let result: ExecutionIntent;
+    try {
+      result = await engine.executeBuy(plan, manualActionKey());
+    } finally {
+      releaseLock();
+    }
 
     if (result.phase === "preview") {
       spinner.succeed(

@@ -8,7 +8,6 @@ tools:
   - dca_history
   - run_once
 metadata:
-  openclaw.requires.env: ["SUWAPPU_API_KEY"]
   openclaw.primaryEnv: SUWAPPU_API_KEY
   openclaw.emoji: "📅"
   openclaw.category: defi
@@ -26,6 +25,7 @@ Treat recurring purchase plans as durable economic intent, not as permission to 
 - Require `SUWAPPU_WALLET_ADDRESS` for a managed wallet-aware quote/simulation.
 - Never infer execution authority from an API key, funded wallet, enabled schedule, or prior live run.
 - Use Suwappu's unsigned transaction preparation path for self-custody rather than this scheduler's managed endpoint.
+- Require an API key only for network operations. Local plan status and plain journal history must remain inspectable without credentials.
 
 ## Plan contract
 
@@ -55,6 +55,7 @@ Preserve this order:
 persist intent
   -> fresh wallet-aware quote + gas/TTL guard
   -> /swap/simulate with would_execute === true
+  -> re-check quote TTL after simulation
   -> persist submitting
   -> /swap/execute with intent ID as Idempotency-Key
   -> reconcile known swap ID to terminal status/final amounts
@@ -62,7 +63,7 @@ persist intent
 
 An HTTP/top-level `success: true` simulation is insufficient when `would_execute` is false.
 
-Treat timeout, network failure after write, 5xx, or malformed successful execute response as `outcome_unknown`. Retry the same economic terms only with the same persisted idempotency key.
+Treat timeout, network failure after write, HTTP 408/5xx, or malformed successful execute response as `outcome_unknown`. Retry the same economic terms only with the same persisted idempotency key.
 
 If a plan has a `prepared`, `submitting`, `submitted`, or `outcome_unknown` action, recover that action before a fresh schedule installment. A known swap ID is poll-only; never resubmit it.
 
@@ -74,11 +75,11 @@ Start validated schedules in preview mode by default. In managed mode, keep back
 
 ### `dca_status`
 
-Show plan ID, USDC amount, destination, chain, cron, timezone, gas ceiling, and enabled state. Do not execute.
+Show plan ID, USDC amount, destination, chain, cron, timezone, gas ceiling, and enabled state. This is local validation: do not require an API key and do not make a network request.
 
 ### `dca_history`
 
-Show distinct `preview`, `prepared`, `submitting`, `submitted`, `completed`, `failed`, and `outcome_unknown` states. Reconciliation may poll known swap IDs but must never create a quote or submit.
+Show distinct `preview`, `prepared`, `submitting`, `submitted`, `completed`, `failed`, and `outcome_unknown` states. Plain history is local and credential-free. Reconciliation may poll known swap IDs but must never create a quote or submit.
 
 ### `run_once`
 
@@ -86,8 +87,14 @@ Preview one fixed-USDC action by default. Require an explicit gas ceiling. If an
 
 ## State safety
 
-Keep `execution-journal.json` durable. Never delete an unresolved intent to clear an error. The local JSON implementation is single-writer; use transactional storage and uniqueness/locking before multiple replicas.
+Keep `execution-journal.json` durable. Never delete an unresolved intent to clear an error. CLI write sessions acquire `execution.lock`; never auto-delete a stale lock, and only clear one after proving the recorded owner is gone. The journal uses owner-only permissions, atomic replacement, and a soft retention target that never prunes completed/unresolved execution evidence.
+
+Use `SUWAPPU_OPERATION_TIMEOUT_MS` to keep operations bounded. If `SUWAPPU_API_EVENTS` is enabled, emit metadata only: operation/outcome/duration/status, never keys, wallet/market terms, quote/swap IDs, response bodies, or error text.
+
+Strictly bind returned quote tokens, simulation quote ID, managed-execute success, and status swap ID to the request. A parseable/HTTP-successful response is not by itself execution proof.
+
+For multiple hosts/replicas, replace local JSON/locking with transactional storage plus uniqueness on tenant + plan + schedule slot and distributed serialization.
 
 Use server-side wallet policies as an independent limit; client cron/amount/gas checks are defense in depth.
 
-Builder docs: https://docs.suwappu.bot
+Builder/product docs: https://docs.suwappu.bot and `BUILDING_A_PRODUCT.md`. Sell workflow, control, history, approvals, and bounded automation—not promised investment returns.

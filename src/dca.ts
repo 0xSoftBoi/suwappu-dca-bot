@@ -1,4 +1,4 @@
-import cron from "node-cron";
+import cron, { type ScheduledTask } from "node-cron";
 import {
   DEFAULT_MAX_DCA_USDC,
   validatePlan,
@@ -90,12 +90,13 @@ export function qualifyDcaQuote(
     toAmountMin: quote.toAmountMin,
     estimatedGasUsd: quote.estimatedGasUsd,
     reportedRouteFeeUsd: quote.reportedRouteFeeUsd,
+    expiresAtMs: quote.expiresAtMs,
   };
 }
 
 export class DCAEngine {
   private readonly plans: DCAPlan[] = [];
-  private readonly tasks: cron.ScheduledTask[] = [];
+  private readonly tasks: ScheduledTask[] = [];
   private readonly runningPlans = new Set<string>();
   private recoveryTimer?: ReturnType<typeof setInterval>;
 
@@ -130,13 +131,15 @@ export class DCAEngine {
 
     for (const plan of this.plans) {
       if (!plan.enabled) continue;
-      const task = cron.schedule(plan.schedule, async () => {
+      const task = cron.schedule(plan.schedule, async (context) => {
         if (this.runningPlans.has(plan.id)) {
           console.warn(`[${new Date().toISOString()}] Skipping overlapping callback: ${plan.name}`);
           return;
         }
         this.runningPlans.add(plan.id);
-        const actionKey = scheduledActionKey(plan);
+        // Bind durable identity to the scheduler's intended instant rather than
+        // callback wall time, which may be delayed across a minute boundary.
+        const actionKey = scheduledActionKey(plan, context.date);
         try {
           console.log(`[${new Date().toISOString()}] DCA trigger: ${plan.name} (${actionKey})`);
           const result = await this.executeBuy(plan, actionKey);
@@ -148,7 +151,7 @@ export class DCAEngine {
         } finally {
           this.runningPlans.delete(plan.id);
         }
-      }, { timezone: plan.timezone });
+      }, { timezone: plan.timezone, noOverlap: true, name: plan.id });
       this.tasks.push(task);
     }
   }

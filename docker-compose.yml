@@ -1,0 +1,13 @@
+services:
+  dca:
+    build: .
+    env_file: .env
+    volumes:
+      - dca-state:/data
+      - ./examples/dca-config.example.json:/config/config.json:ro
+    command: ["bun", "src/index.ts", "status", "--config", "/config/config.json"]
+    # A money-moving scheduler should not be hidden behind an unconditional restart loop.
+    restart: "no"
+
+volumes:
+  dca-state:

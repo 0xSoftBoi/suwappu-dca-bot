@@ -1,4 +1,16 @@
-import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { randomUUID } from "node:crypto";
+import {
+  chmodSync,
+  closeSync,
+  existsSync,
+  fsyncSync,
+  mkdirSync,
+  openSync,
+  readFileSync,
+  renameSync,
+  unlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import {
@@ -76,6 +88,7 @@ export interface QuoteForExecution {
   toAmountMin: string;
   estimatedGasUsd: number;
   reportedRouteFeeUsd: number | null;
+  expiresAtMs: number;
 }
 
 const EXECUTION_PHASES = new Set<ExecutionPhase>([
@@ -103,25 +116,89 @@ function journalFile(): string {
   return join(stateDir(), "execution-journal.json");
 }
 
+function lockFile(): string {
+  return join(stateDir(), "execution.lock");
+}
+
+function ensureStateDir(): string {
+  const dir = stateDir();
+  if (!existsSync(dir)) mkdirSync(dir, { recursive: true, mode: 0o700 });
+  chmodSync(dir, 0o700);
+  return dir;
+}
+
+function journalLimit(): number {
+  const value = Number(process.env.SUWAPPU_DCA_JOURNAL_LIMIT ?? "5000");
+  if (!Number.isInteger(value) || value < 1 || value > 100_000) {
+    throw new Error(
+      "SUWAPPU_DCA_JOURNAL_LIMIT must be an integer between 1 and 100000",
+    );
+  }
+  return value;
+}
+
+function applyJournalRetention(entries: ExecutionIntent[]): ExecutionIntent[] {
+  let excess = entries.length - journalLimit();
+  if (excess <= 0) return entries;
+
+  // This is deliberately a soft target. Only preview-only evidence is
+  // disposable; failed/completed/unresolved execution records are retained.
+  return entries.filter((intent) => {
+    const safelyDisposable = intent.phase === "preview";
+    if (excess > 0 && safelyDisposable) {
+      excess -= 1;
+      return false;
+    }
+    return true;
+  });
+}
+
+function optionalString(value: unknown): boolean {
+  return value === undefined || typeof value === "string";
+}
+
+function optionalNonNegativeNumber(value: unknown): boolean {
+  return value === undefined
+    || (typeof value === "number" && Number.isFinite(value) && value >= 0);
+}
+
 function isExecutionIntent(value: unknown): value is ExecutionIntent {
   if (!value || typeof value !== "object") return false;
   const intent = value as Partial<ExecutionIntent>;
   const terms = intent.terms as Partial<EconomicTerms> | undefined;
+  const amount = Number(terms?.amount);
   return typeof intent.id === "string"
+    && intent.id.length > 0
     && typeof intent.planId === "string"
+    && intent.planId.length > 0
     && typeof intent.actionKey === "string"
+    && intent.actionKey.length > 0
     && typeof intent.phase === "string"
     && EXECUTION_PHASES.has(intent.phase as ExecutionPhase)
     && !!terms
-    && typeof terms.fromToken === "string"
-    && typeof terms.toToken === "string"
+    && typeof terms.fromToken === "string" && terms.fromToken.length > 0
+    && typeof terms.toToken === "string" && terms.toToken.length > 0
     && typeof terms.amount === "string"
-    && typeof terms.chain === "string"
+    && Number.isFinite(amount) && amount > 0
+    && typeof terms.chain === "string" && terms.chain.length > 0
     && typeof intent.maxGasUsd === "number"
     && Number.isFinite(intent.maxGasUsd)
     && intent.maxGasUsd > 0
-    && typeof intent.createdAt === "string"
-    && typeof intent.updatedAt === "string";
+    && typeof intent.createdAt === "string" && intent.createdAt.length > 0
+    && typeof intent.updatedAt === "string" && intent.updatedAt.length > 0
+    && optionalString(intent.quoteId)
+    && optionalString(intent.quotedToAmount)
+    && optionalString(intent.quotedToAmountMin)
+    && optionalNonNegativeNumber(intent.estimatedGasUsd)
+    && optionalNonNegativeNumber(intent.reportedRouteFeeUsd)
+    && optionalString(intent.swapId)
+    && optionalString(intent.swapStatus)
+    && optionalString(intent.txHash)
+    && optionalString(intent.actualFromAmount)
+    && optionalString(intent.actualToAmount)
+    && optionalString(intent.error)
+    && (intent.warnings === undefined
+      || (Array.isArray(intent.warnings) && intent.warnings.every((warning) => typeof warning === "string")));
 }
 
 function loadJournal(): ExecutionIntent[] {
@@ -141,12 +218,89 @@ function loadJournal(): ExecutionIntent[] {
 }
 
 function saveJournal(entries: ExecutionIntent[]): void {
-  const dir = stateDir();
-  if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
+  const dir = ensureStateDir();
   const target = journalFile();
-  const temporary = `${target}.${process.pid}.tmp`;
-  writeFileSync(temporary, JSON.stringify(entries, null, 2));
-  renameSync(temporary, target);
+  const temporary = `${target}.${process.pid}.${randomUUID()}.tmp`;
+  let fd: number | undefined;
+  try {
+    fd = openSync(temporary, "wx", 0o600);
+    writeFileSync(fd, JSON.stringify(applyJournalRetention(entries), null, 2), "utf8");
+    fsyncSync(fd);
+    closeSync(fd);
+    fd = undefined;
+    renameSync(temporary, target);
+    chmodSync(target, 0o600);
+    try {
+      const dirFd = openSync(dir, "r");
+      try {
+        fsyncSync(dirFd);
+      } finally {
+        closeSync(dirFd);
+      }
+    } catch {
+      // Directory fsync is unavailable on some filesystems/platforms.
+    }
+  } catch (error) {
+    if (fd !== undefined) closeSync(fd);
+    if (existsSync(temporary)) unlinkSync(temporary);
+    throw error;
+  }
+}
+
+export class ExecutionLockError extends Error {
+  constructor(readonly path: string) {
+    super(
+      `Execution lock ${path} already exists; another journal writer may be active. Prove the owning process is gone before clearing a stale lock`,
+    );
+    this.name = "ExecutionLockError";
+  }
+}
+
+/**
+ * Own the local journal for a scheduler/run/reconciliation write session.
+ * Release verifies an ownership token so it never deletes a replacement lock.
+ */
+export function acquireExecutionLock(): () => void {
+  journalLimit();
+  ensureStateDir();
+  const path = lockFile();
+  const ownerToken = randomUUID();
+  let fd: number;
+  try {
+    fd = openSync(path, "wx", 0o600);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "EEXIST") {
+      throw new ExecutionLockError(path);
+    }
+    throw error;
+  }
+
+  try {
+    writeFileSync(fd, JSON.stringify({
+      pid: process.pid,
+      acquiredAt: new Date().toISOString(),
+      ownerToken,
+    }), "utf8");
+    fsyncSync(fd);
+  } catch (error) {
+    closeSync(fd);
+    if (existsSync(path)) unlinkSync(path);
+    throw error;
+  }
+
+  let released = false;
+  return () => {
+    if (released) return;
+    released = true;
+    closeSync(fd);
+    if (!existsSync(path)) return;
+    try {
+      const current = JSON.parse(readFileSync(path, "utf8")) as { ownerToken?: unknown };
+      if (current.ownerToken === ownerToken) unlinkSync(path);
+    } catch {
+      // Never delete a lock whose current ownership cannot be proven.
+    }
+  };
 }
 
 function saveEntry(entry: ExecutionIntent): void {
@@ -367,6 +521,15 @@ export async function runManagedExecution(args: {
     intent.error = hadSubmissionRisk
       ? `Retry simulation blocked while an earlier submission may have executed${warnings}`
       : `Simulation blocked execution${warnings}`;
+    saveEntry(intent);
+    return intent;
+  }
+
+  if (quote.expiresAtMs <= Date.now() + 5_000) {
+    intent.phase = hadSubmissionRisk ? "outcome_unknown" : "failed";
+    intent.error = hadSubmissionRisk
+      ? "Retry quote expired after simulation while an earlier submission may have executed"
+      : "Quote has 5 seconds or less remaining after simulation; refusing submission";
     saveEntry(intent);
     return intent;
   }
