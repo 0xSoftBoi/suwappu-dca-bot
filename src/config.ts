@@ -19,7 +19,6 @@ export interface DCAPlan {
 }
 
 export interface DCAConfig {
-  apiKey: string;
   plans: DCAPlan[];
 }
 
@@ -154,13 +153,6 @@ export function loadConfig(configPath?: string): DCAConfig {
     throw new Error("Config validation failed: 'plans' must be an array.");
   }
 
-  const apiKey = process.env.SUWAPPU_API_KEY;
-  if (!apiKey) {
-    throw new Error(
-      "Missing API key. Set SUWAPPU_API_KEY; this reference does not load credentials from the plan file.",
-    );
-  }
-
   const capText = process.env.SUWAPPU_MAX_DCA_USDC ?? DEFAULT_MAX_DCA_USDC;
   const plans = parsed.plans.map((plan, index) => validatePlan(plan, `plan[${index}]`, capText));
   const ids = new Set<string>();
@@ -168,5 +160,5 @@ export function loadConfig(configPath?: string): DCAConfig {
     if (ids.has(plan.id)) throw new Error(`Config validation failed: duplicate plan id '${plan.id}'.`);
     ids.add(plan.id);
   }
-  return { apiKey, plans };
+  return { plans };
 }

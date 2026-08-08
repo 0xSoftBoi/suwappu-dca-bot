@@ -1,5 +1,42 @@
 const DEFAULT_API_BASE_URL = "https://api.suwappu.bot";
-const REQUEST_TIMEOUT_MS = 30_000;
+const DEFAULT_OPERATION_TIMEOUT_MS = 25_000;
+
+type ApiOperation = "quote" | "simulate" | "execute" | "status";
+type ApiOutcome =
+  | "response_ok"
+  | "http_error"
+  | "protocol_error"
+  | "timeout"
+  | "network_error";
+
+export function operationTimeoutMs(): number {
+  const value = Number(
+    process.env.SUWAPPU_OPERATION_TIMEOUT_MS ?? DEFAULT_OPERATION_TIMEOUT_MS,
+  );
+  if (!Number.isFinite(value) || value < 100 || value > 30_000) {
+    throw new Error(
+      "SUWAPPU_OPERATION_TIMEOUT_MS must be between 100 and 30000 milliseconds",
+    );
+  }
+  return value;
+}
+
+function emitApiEvent(
+  operation: ApiOperation,
+  outcome: ApiOutcome,
+  startedAt: number,
+  status?: number,
+): void {
+  if (!/^(1|true)$/i.test(process.env.SUWAPPU_API_EVENTS ?? "")) return;
+  const event: Record<string, string | number> = {
+    operation,
+    outcome,
+    duration_ms: Math.round((performance.now() - startedAt) * 10) / 10,
+  };
+  if (status !== undefined) event.status = status;
+  // Never emit credentials, wallet/market terms, IDs, bodies, or error text.
+  console.error(`suwappu_api_event ${JSON.stringify(event)}`);
+}
 
 function apiBaseUrl(): string {
   return (process.env.SUWAPPU_API_URL ?? DEFAULT_API_BASE_URL).replace(/\/$/, "");
@@ -75,13 +112,31 @@ function parseUsd(value: unknown): number | null {
   return Number.isFinite(parsed) && parsed >= 0 ? parsed : null;
 }
 
+function requireToken(value: unknown, field: string): string {
+  if (typeof value === "object" && value !== null && "symbol" in value) {
+    const symbol = (value as { symbol?: unknown }).symbol;
+    if (typeof symbol === "string" && symbol.trim()) return symbol.trim().toUpperCase();
+  }
+  if (typeof value === "string" && value.trim()) return value.trim().toUpperCase();
+  throw new Error(`Malformed Suwappu response: missing ${field}`);
+}
+
+function isNonEmptyId(value: unknown): value is string | number {
+  return (typeof value === "string" && value.trim().length > 0)
+    || (typeof value === "number" && Number.isFinite(value));
+}
+
 async function request<T extends Record<string, unknown>>(
   apiKey: string,
+  operation: ApiOperation,
   method: string,
   path: string,
   json?: unknown,
 ): Promise<T> {
+  const startedAt = performance.now();
+  const timeoutMs = operationTimeoutMs();
   let response: Response;
+  let text: string;
   try {
     response = await fetch(`${apiBaseUrl()}${path}`, {
       method,
@@ -89,25 +144,32 @@ async function request<T extends Record<string, unknown>>(
         Authorization: `Bearer ${apiKey}`,
         "Content-Type": "application/json",
       },
-      signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+      signal: AbortSignal.timeout(timeoutMs),
       ...(json !== undefined ? { body: JSON.stringify(json) } : {}),
     });
+    text = await response.text();
   } catch (error) {
-    throw new SuwappuRequestError(error instanceof Error ? error.message : String(error));
+    const timeout = error instanceof Error && ["TimeoutError", "AbortError"].includes(error.name);
+    emitApiEvent(operation, timeout ? "timeout" : "network_error", startedAt);
+    throw new SuwappuRequestError(
+      `Suwappu ${operation} ${timeout ? "timed out" : "transport failed"}`,
+    );
   }
 
-  const text = await response.text();
   if (!response.ok) {
-    let detail = text || response.statusText;
-    try {
-      const parsed = parseJson(text);
-      detail = String(parsed.error ?? parsed.message ?? detail);
-    } catch {}
-    throw new SuwappuRequestError(`Suwappu API error ${response.status}: ${detail}`, {
+    emitApiEvent(operation, "http_error", startedAt, response.status);
+    throw new SuwappuRequestError(`Suwappu ${operation} API error ${response.status}`, {
       httpStatus: response.status,
     });
   }
-  return parseJson(text) as T;
+  try {
+    const payload = parseJson(text) as T;
+    emitApiEvent(operation, "response_ok", startedAt, response.status);
+    return payload;
+  } catch {
+    emitApiEvent(operation, "protocol_error", startedAt, response.status);
+    throw new SuwappuRequestError(`Malformed Suwappu ${operation} response`);
+  }
 }
 
 export async function getQuote(
@@ -130,7 +192,9 @@ export async function getQuote(
     bridge_fee_usd?: string | number;
     dex?: string;
     expires_in_seconds?: number;
-  }>(apiKey, "POST", "/v1/agent/quote", {
+    from_token?: unknown;
+    to_token?: unknown;
+  }>(apiKey, "quote", "POST", "/v1/agent/quote", {
     from_token: args.from,
     to_token: args.to,
     amount: args.amount,
@@ -138,8 +202,13 @@ export async function getQuote(
     ...(args.walletAddress ? { wallet_address: args.walletAddress } : {}),
   });
 
-  if (payload.success !== true || !payload.quote_id) {
+  if (payload.success !== true || typeof payload.quote_id !== "string" || !payload.quote_id.trim()) {
     throw new Error("Malformed quote response: missing success/quote_id");
+  }
+  const fromToken = requireToken(payload.from_token, "from_token");
+  const toToken = requireToken(payload.to_token, "to_token");
+  if (fromToken !== args.from.trim().toUpperCase() || toToken !== args.to.trim().toUpperCase()) {
+    throw new Error("Malformed quote response: returned token pair did not match request");
   }
   const amountIn = parsePositive(payload.amount_in, "amount_in");
   const amountOut = parsePositive(payload.amount_out, "amount_out");
@@ -171,13 +240,19 @@ export async function simulateSwap(
   walletAddress: string,
 ): Promise<SwapSimulation> {
   const payload = await request<{
+    success?: boolean;
+    quote_id?: unknown;
     would_execute?: boolean;
     warnings?: unknown[];
     checks?: Array<{ name?: unknown; status?: unknown; detail?: unknown }>;
-  }>(apiKey, "POST", "/v1/agent/swap/simulate", {
+  }>(apiKey, "simulate", "POST", "/v1/agent/swap/simulate", {
     quote_id: quoteId,
     wallet_address: walletAddress,
   });
+
+  if (payload.success !== true || payload.quote_id !== quoteId) {
+    throw new Error("Malformed simulation response: success/quote_id did not match request");
+  }
 
   return {
     wouldExecute: payload.would_execute === true,
@@ -201,7 +276,10 @@ export async function executeManagedSwap(
     throw new Error("Idempotency key must be 1-64 characters using A-Z, a-z, 0-9, _, ., :, or -");
   }
 
+  const startedAt = performance.now();
+  const timeoutMs = operationTimeoutMs();
   let response: Response;
+  let text: string;
   try {
     response = await fetch(`${apiBaseUrl()}/v1/agent/swap/execute`, {
       method: "POST",
@@ -211,33 +289,47 @@ export async function executeManagedSwap(
         "Idempotency-Key": idempotencyKey,
       },
       body: JSON.stringify({ quote_id: quoteId }),
-      signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+      signal: AbortSignal.timeout(timeoutMs),
     });
+    text = await response.text();
   } catch (error) {
-    throw new SuwappuRequestError(error instanceof Error ? error.message : String(error), {
+    const timeout = error instanceof Error && ["TimeoutError", "AbortError"].includes(error.name);
+    emitApiEvent("execute", timeout ? "timeout" : "network_error", startedAt);
+    throw new SuwappuRequestError(
+      `Managed swap ${timeout ? "timed out" : "transport failed"}`,
+      {
       outcomeUnknown: true,
-    });
-  }
-
-  const text = await response.text();
-  let payload: Record<string, unknown> = {};
-  try {
-    payload = parseJson(text);
-  } catch {
-    if (response.ok) {
-      throw new SuwappuRequestError("Malformed managed swap response", { outcomeUnknown: true });
-    }
+      },
+    );
   }
 
   if (!response.ok) {
-    throw new SuwappuRequestError(
-      String(payload.error ?? payload.message ?? `Suwappu API error ${response.status}`),
-      { httpStatus: response.status, outcomeUnknown: response.status >= 500 },
-    );
+    emitApiEvent("execute", "http_error", startedAt, response.status);
+    throw new SuwappuRequestError(`Managed swap API error ${response.status}`, {
+      httpStatus: response.status,
+      outcomeUnknown: response.status === 408 || response.status >= 500,
+    });
   }
-  if (payload.swap_id === undefined || typeof payload.status !== "string") {
-    throw new SuwappuRequestError("Malformed managed swap response", { outcomeUnknown: true });
+
+  let payload: Record<string, unknown>;
+  try {
+    payload = parseJson(text);
+  } catch {
+    emitApiEvent("execute", "protocol_error", startedAt, response.status);
+    throw new SuwappuRequestError("Malformed managed swap response", {
+      outcomeUnknown: true,
+    });
   }
+  if (payload.success !== true
+    || !isNonEmptyId(payload.swap_id)
+    || typeof payload.status !== "string"
+    || !payload.status.trim()) {
+    emitApiEvent("execute", "protocol_error", startedAt, response.status);
+    throw new SuwappuRequestError("Malformed managed swap response", {
+      outcomeUnknown: true,
+    });
+  }
+  emitApiEvent("execute", "response_ok", startedAt, response.status);
 
   const tracking = payload.tracking as { poll_url?: unknown } | undefined;
   return {
@@ -258,15 +350,20 @@ export function isFailedSwapStatus(status: string): boolean {
 
 export async function getManagedSwapStatus(apiKey: string, swapId: string): Promise<ManagedSwapStatus> {
   const payload = await request<{
+    success?: boolean;
     swap_id?: string | number;
     status?: string;
     tx_hash?: string | null;
     from_amount?: string;
     to_amount?: string | null;
     error_message?: string | null;
-  }>(apiKey, "GET", `/v1/agent/swap/status/${encodeURIComponent(swapId)}`);
+  }>(apiKey, "status", "GET", `/v1/agent/swap/status/${encodeURIComponent(swapId)}`);
 
-  if (payload.swap_id === undefined || typeof payload.status !== "string") {
+  if (payload.success !== true
+    || !isNonEmptyId(payload.swap_id)
+    || String(payload.swap_id) !== swapId
+    || typeof payload.status !== "string"
+    || !payload.status.trim()) {
     throw new Error("Malformed managed swap status response");
   }
   return {

@@ -2,7 +2,7 @@
 
 An outcome-safe reference for building fixed-dollar recurring purchase products on [Suwappu](https://suwappu.bot).
 
-This repository focuses on the hard part of DCA automation: turning one scheduled wall-clock slot into at most one durable economic action, then following that action through quote, permission, idempotent submission, and terminal reconciliation.
+This repository focuses on the hard part of DCA automation: turning one scheduled wall-clock slot into at most one durable economic action, then following that action through quote, permission, idempotent submission, and terminal reconciliation. Version 2 adds an enforceable single-writer state boundary, bounded/sanitized network operations, least-authority local commands, and deployment/release gates.
 
 > This is an integration reference, not a claim that DCA is profitable or financial advice. It does not choose assets, predict returns, or guarantee that a recurring plan will outperform another allocation.
 
@@ -13,13 +13,17 @@ This repository focuses on the hard part of DCA automation: turning one schedule
 | “DCA” amount is ambiguous | This reference accepts USDC only, so plan amounts/caps are fixed-dollar accounting |
 | Cron fires twice or a DST hour repeats | Stable plan ID + local wall-clock schedule-slot key dedupes the action |
 | Process restarts after a money-moving request | Atomic durable intent exists before submission risk |
+| Two local processes point at the same state | Exclusive journal-writer lock fails the second process closed |
 | Execute response times out | Preserve `outcome_unknown` and retry only with the original `Idempotency-Key` |
 | Old swap is still pending at the next slot | The unresolved action owns the plan; reconcile/recover it and skip the new installment |
 | Quote is technically valid but uneconomic | Require `estimated_gas_usd <= maxGasUsd` and useful quote TTL |
 | Simulation request returned HTTP 200 | Still require `would_execute === true` |
 | Submission looks successful | Poll status and keep final amounts distinct from quoted amounts |
+| Upstream stalls or sends a noisy error body | Bounded request deadline + sanitized error + metadata-only optional telemetry |
 
-If you are turning the scheduler into a paid product, continue with [BUILDING_A_PRODUCT.md](BUILDING_A_PRODUCT.md).
+If you are turning the scheduler into a paid product, continue with [BUILDING_A_PRODUCT.md](BUILDING_A_PRODUCT.md). For live operation, use the [operations runbook](docs/OPERATIONS.md).
+
+This is enterprise-grade in its **operating invariants**, not a claim that a local JSON process is a distributed multi-tenant SaaS. The graduation boundary is explicit below.
 
 ## Safe execution model
 
@@ -40,20 +44,23 @@ git clone https://github.com/0xSoftBoi/suwappu-dca-bot.git
 cd suwappu-dca-bot
 bun install --frozen-lockfile
 
+mkdir -p ~/.suwappu-dca
+cp examples/dca-config.example.json ~/.suwappu-dca/config.json
+
+# Local plan validation: no API credential and no network request.
+bun src/index.ts status
+
 curl -X POST https://api.suwappu.bot/v1/agent/register \
   -H "Content-Type: application/json" \
   -d '{"name":"my-dca-bot"}'
 
 export SUWAPPU_API_KEY=suwappu_sk_...
 
-mkdir -p ~/.suwappu-dca
-cp examples/dca-config.example.json ~/.suwappu-dca/config.json
-
 # Every scheduled trigger is quote-only preview.
 bun src/index.ts start
 ```
 
-The plan file never loads an API key. Keep credentials in environment/secret management, not alongside schedule configuration.
+The plan file never loads an API key. `status` and plain `history` work without one; `start`, `run-once`, and `history --reconcile` require it because they perform Suwappu network operations. Keep credentials in environment/secret management, not alongside schedule configuration.
 
 ## Plan configuration
 
@@ -136,10 +143,11 @@ For each new scheduled action, the managed path:
 1. persists the exact plan/action/economic terms;
 2. obtains a fresh wallet-aware quote and applies the gas/TTL guard;
 3. calls `/swap/simulate` and requires **`would_execute: true`**;
-4. persists `submitting` before the network request;
-5. sends the durable intent ID as `Idempotency-Key` to `/swap/execute`;
-6. records a known swap ID and reconciles `/swap/status/:id` once per minute while the scheduler is running;
-7. stores terminal status and final amounts when available.
+4. re-checks quote TTL after simulation so a delayed simulation cannot promote an already-expiring route;
+5. persists `submitting` before the network request;
+6. sends the durable intent ID as `Idempotency-Key` to `/swap/execute`;
+7. records a known swap ID and reconciles `/swap/status/:id` once per minute while the scheduler is running;
+8. stores terminal status and final amounts when available.
 
 An HTTP-successful simulation can still say `would_execute: false`. That is a block, not permission.
 
@@ -182,24 +190,39 @@ bun src/index.ts history --reconcile
 
 The journal distinguishes `preview`, `prepared`, `submitting`, `submitted`, `completed`, `failed`, and `outcome_unknown`. `--reconcile` polls known swap IDs only; it never quotes or submits.
 
-By default the journal is `~/.suwappu-dca/execution-journal.json`; override its directory with `SUWAPPU_DCA_STATE_DIR`. Writes are atomic. Do not delete unresolved records to “unstick” a plan: losing an idempotency key can turn recovery into a second economic action.
+By default the journal is `~/.suwappu-dca/execution-journal.json`; override its directory with `SUWAPPU_DCA_STATE_DIR`. `start`, `run-once`, and `history --reconcile` acquire `execution.lock`, so a local state directory has one writer. State uses directory `0700` / file `0600` permissions, file `fsync`, atomic replacement, and fail-closed parsing. A stale lock is never auto-cleared; prove its recorded process is gone first. See the [operations runbook](docs/OPERATIONS.md).
 
-This local journal assumes one process owns the state directory. Before horizontal scaling, move intents to transactional durable storage with uniqueness/locking around plan/action keys.
+`SUWAPPU_DCA_JOURNAL_LIMIT` defaults to `5000` as a **soft** target. Only preview records may be pruned when over the target; failed, completed, and unresolved execution evidence is retained. Do not delete unresolved records to “unstick” a plan: losing an idempotency key can turn recovery into a second economic action.
+
+Before horizontal scaling, move intents to transactional durable storage with uniqueness/locking around tenant + plan + schedule-slot keys. A local file lock is not distributed consensus.
+
+### Deadlines and metadata-only events
+
+Every Suwappu operation is bounded by `SUWAPPU_OPERATION_TIMEOUT_MS` (default `25000`, allowed `100`–`30000`ms). A managed execute timeout, HTTP 408/5xx, transport failure, or malformed successful execute response stays `outcome_unknown`.
+
+Set `SUWAPPU_API_EVENTS=1` to emit operation/outcome/duration/HTTP-status events on stderr. These deliberately exclude credentials, wallet/market terms, quote/swap IDs, response bodies, and error text. They are observability metadata, not transaction-success evidence.
 
 ## Commands
 
 | Command | Purpose |
 |---|---|
 | `start` | Validate and schedule all enabled plans; preview by default |
-| `status` | Validate/show plan amount, cadence, timezone, gas ceiling, enabled state |
-| `history` | Show the durable action journal; optional read-only reconciliation |
+| `status` | Local-only validation/show of amount, cadence, timezone, gas ceiling, enabled state |
+| `history` | Local-only durable journal view; `--reconcile` adds known-ID status polling |
 | `run-once` | Preview one fixed-USDC action; add `--execute` for managed submission |
 
 ## Suwappu authority boundary
 
-`src/suwappu.ts` is a small typed adapter over the production quote, simulation, managed execute, and status contracts this example actually needs. That keeps the example independent of registry-release timing while still making the API boundary explicit.
+`src/suwappu.ts` is a small typed adapter over the production quote, simulation, managed execute, and status contracts this example actually needs. It requires matching returned token/quote/swap identity and `success: true`, applies bounded deadlines, and never copies upstream HTTP bodies into request errors. That keeps the example independent of registry-release timing while still making the API boundary explicit.
 
-Suwappu's hosted MCP endpoint is `https://api.suwappu.bot/mcp`. Its historically named `execute_swap` flow prepares an unsigned/self-custody transaction; it is not the managed `/swap/execute` endpoint used by this scheduler. Keep “prepare for a wallet to sign” separate from “submit from a managed wallet.”
+| Surface | Authority |
+|---|---|
+| Agent REST `/v1/agent/swap` | Prepare an unsigned/self-custody transaction |
+| Agent REST `/v1/agent/swap/execute` | Managed-wallet sign/broadcast path used here |
+| TypeScript/Python SDK managed-execute helpers | Managed-wallet execution when present in the installed SDK version |
+| Hosted MCP `execute_swap` | Historically named unsigned/self-custody preparation, **not** managed broadcast |
+
+Suwappu's hosted MCP endpoint is `https://api.suwappu.bot/mcp`. Keep “prepare for a wallet to sign” separate from “submit from a managed wallet,” and treat the installed SDK exports/current docs as authority when registry and source versions differ.
 
 ## How this stacks up
 
@@ -208,19 +231,32 @@ This repository should stay a small Suwappu recurring-action reference.
 | Project | What it demonstrates | What builders should copy |
 |---|---|---|
 | This repository | Scheduled fixed-USDC Suwappu actions with durable recovery | plan/slot identity, cost gate, permission, idempotency, reconciliation |
-| [Hummingbot DCAExecutor](https://hummingbot.org/strategies/v2-strategies/executors/dcaexecutor/) | A DCA Executor with its own order/execution lifecycle | Move to an executor/controller architecture when one recurring swap becomes multi-order strategy state |
+| [Hummingbot Strategy V2 / DCAExecutor](https://hummingbot.org/strategies/v2-strategies/) | Finite executors managed directly or by controllers, including a DCA executor | Move to an executor/controller architecture when one recurring swap becomes multi-order strategy state |
 | [Freqtrade position adjustment](https://www.freqtrade.io/en/stable/strategy-callbacks/) | DCA-style position adjustment inside a full strategy system | Use strict re-entry logic/limits; its docs explicitly warn loose logic can place repeated entries very quickly |
 
 Suwappu is the financial action plane here. Use a deeper trading framework when the problem becomes strategy research, position lifecycle, exits, or many-order orchestration.
+
+## Container contract
+
+The image runs as a non-root user with `/data` reserved for durable state. Its default command validates the included example plan and exits **without a network request**:
+
+```bash
+docker build -t suwappu-dca-bot .
+docker run --rm suwappu-dca-bot
+```
+
+To schedule a real plan, mount configuration/state and select `start` explicitly. Managed mode still needs both live gates and should not sit behind an unconditional restart loop. `docker-compose.yml` intentionally defaults to local plan validation with `restart: "no"`.
 
 ## Develop
 
 ```bash
 bun run typecheck
 bun test
+bun run build
+bun audit --audit-level=high
 ```
 
-CI uses Bun 1.3.14, a frozen lockfile, blocking typecheck, and regression tests for schedule identity, caps/gas, `would_execute`, durable journal corruption, same-key ambiguous retry, known-swap reconciliation, and final amounts.
+`bun run verify` runs the same local release gate. CI uses Bun 1.3.14 and the frozen lockfile, then blocks on typecheck/tests, standalone build, high-severity dependency audit, non-root container/Compose validation, and CodeQL. Regression coverage includes schedule identity, caps/gas, strict response binding, `would_execute`, state locking/permissions, journal corruption, same-key ambiguous retry, known-swap reconciliation, and final amounts.
 
 ## Build further
 

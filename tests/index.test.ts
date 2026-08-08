@@ -1,5 +1,9 @@
 import { afterEach, describe, expect, it } from "bun:test";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import {
+  loadConfig,
   validateDcaSchedule,
   validatePlan,
   type DCAPlan,
@@ -7,12 +11,15 @@ import {
 import { qualifyDcaQuote, scheduledActionKey } from "../src/dca.js";
 import {
   getQuote,
+  operationTimeoutMs,
   simulateSwap,
   type QuoteResult,
 } from "../src/suwappu.js";
 
 const originalFetch = globalThis.fetch;
 const originalApiUrl = process.env.SUWAPPU_API_URL;
+const originalApiKey = process.env.SUWAPPU_API_KEY;
+const originalOperationTimeout = process.env.SUWAPPU_OPERATION_TIMEOUT_MS;
 
 const basePlan: DCAPlan = {
   id: "daily-eth",
@@ -38,6 +45,10 @@ afterEach(() => {
   globalThis.fetch = originalFetch;
   if (originalApiUrl === undefined) delete process.env.SUWAPPU_API_URL;
   else process.env.SUWAPPU_API_URL = originalApiUrl;
+  if (originalApiKey === undefined) delete process.env.SUWAPPU_API_KEY;
+  else process.env.SUWAPPU_API_KEY = originalApiKey;
+  if (originalOperationTimeout === undefined) delete process.env.SUWAPPU_OPERATION_TIMEOUT_MS;
+  else process.env.SUWAPPU_OPERATION_TIMEOUT_MS = originalOperationTimeout;
 });
 
 describe("DCA plan contract", () => {
@@ -76,6 +87,18 @@ describe("DCA plan contract", () => {
     expect(first).toBe("schedule.20261101T0130");
     expect(second).toBe(first);
   });
+
+  it("validates a plan file locally without requiring an API credential", () => {
+    const dir = mkdtempSync(join(tmpdir(), "suwappu-dca-config-test-"));
+    const path = join(dir, "config.json");
+    try {
+      delete process.env.SUWAPPU_API_KEY;
+      writeFileSync(path, JSON.stringify({ plans: [basePlan] }));
+      expect(loadConfig(path).plans[0]?.id).toBe("daily-eth");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
 });
 
 describe("quote promotion", () => {
@@ -111,6 +134,8 @@ describe("quote promotion", () => {
       bridge_fee_usd: "0.20",
       expires_in_seconds: 60,
       dex: "router",
+      from_token: "USDC",
+      to_token: "ETH",
     })) as unknown as typeof fetch;
     const parsed = await getQuote("key", {
       from: "USDC",
@@ -126,11 +151,46 @@ describe("quote promotion", () => {
   it("does not confuse HTTP/top-level success with simulation permission", async () => {
     globalThis.fetch = (async () => jsonResponse({
       success: true,
+      quote_id: "q1",
       would_execute: false,
       warnings: ["policy denied"],
     })) as unknown as typeof fetch;
     const simulation = await simulateSwap("key", "q1", "0xabc");
     expect(simulation.wouldExecute).toBe(false);
     expect(simulation.warnings).toEqual(["policy denied"]);
+  });
+
+  it("rejects a quote whose returned token pair does not match the request", async () => {
+    globalThis.fetch = (async () => jsonResponse({
+      success: true,
+      quote_id: "q-wrong-pair",
+      amount_in: "50",
+      amount_out: "0.026",
+      amount_out_min: "0.025",
+      estimated_gas_usd: "1",
+      expires_in_seconds: 60,
+      from_token: "USDC",
+      to_token: "SOL",
+    })) as unknown as typeof fetch;
+
+    await expect(getQuote("key", {
+      from: "USDC",
+      to: "ETH",
+      amount: "50",
+      chain: "base",
+    })).rejects.toThrow("token pair did not match");
+  });
+
+  it("sanitizes upstream HTTP bodies and bounds operation timeouts", async () => {
+    globalThis.fetch = (async () => jsonResponse({ error: "sensitive-upstream-detail" }, 403)) as unknown as typeof fetch;
+    try {
+      await getQuote("key", { from: "USDC", to: "ETH", amount: "50", chain: "base" });
+      throw new Error("expected quote to fail");
+    } catch (error) {
+      expect(error instanceof Error ? error.message : String(error)).not.toContain("sensitive-upstream-detail");
+    }
+
+    process.env.SUWAPPU_OPERATION_TIMEOUT_MS = "99";
+    expect(() => operationTimeoutMs()).toThrow("between 100 and 30000");
   });
 });
