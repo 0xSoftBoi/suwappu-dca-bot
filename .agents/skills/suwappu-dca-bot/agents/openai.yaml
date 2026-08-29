@@ -1,0 +1,6 @@
+interface:
+  display_name: "Suwappu Dca Bot"
+  short_description: "Repo-specific patterns and workflows for suwappu-dca-bot"
+  default_prompt: "Use the suwappu-dca-bot repo skill to follow existing architecture, testing, and workflow conventions."
+policy:
+  allow_implicit_invocation: true
